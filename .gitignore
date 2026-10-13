@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.deb
+*.tar.gz
+*.rpm
+
+# Logs
+*.log
+
+# Config with secrets
+config.toml
+!config.toml.example
+
+# Local Python and agent state (private; not public source inputs)
+__pycache__/
+*.py[cod]
+AGENTS.md
+.agents/
+.codex/
+.memsearch/
+graphify-out/
+.beads/

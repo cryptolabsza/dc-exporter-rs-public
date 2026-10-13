@@ -1,0 +1,71 @@
+# DC Exporter Configuration
+
+# Only these thermal settings are currently applied from this file.
+# Other sections below retain the existing CLI-controlled behavior.
+[thermal]
+vram_backend = "legacy"       # legacy | auto | nvml | rusd | off
+timeout_ms = 2000
+# max_sample_age_ms = 30000   # default: max(3 * CLI interval, deadline)
+# auto/rusd are experimental; RTX 5090 real-card acceptance is pending.
+# --vram-backend and --thermal-*-ms explicitly override this section.
+# Copy to /etc/dc-exporter/config.toml
+
+[agent]
+# Machine identifier (defaults to hostname if set to "auto")
+machine_id = "auto"
+
+# Collection interval in seconds
+interval = 10
+
+# NVML timeout in seconds (for detecting hung GPUs during passthrough)
+# If NVML doesn't respond within this time, the GPU is assumed to be unavailable
+nvml_timeout = 5
+
+# Enable direct register access for VRAM/hotspot temps (requires root + iomem=relaxed)
+enable_register_access = true
+
+[gpu]
+# Enable GPU metrics collection
+enabled = true
+
+# DCXP unique metrics (not available in dcgm-exporter)
+vram_temp = true            # VRAM/memory temperature
+hotspot_temp = true         # Junction/hotspot temperature
+throttle_reasons = true     # Clock throttle reasons
+aer_errors = true           # PCIe AER errors
+gpu_state = true            # GPU state (OK/Warning/Error/VM/Unavailable)
+fan_speed = true            # Fan speed percentage
+
+# DCGM-compatible metrics (disabled by default to avoid duplicates)
+# Enable these only if you're NOT running dcgm-exporter
+gpu_temp = false            # GPU core temperature
+power_usage = false         # Power consumption (watts)
+sm_clock = false            # SM clock frequency (MHz)
+mem_clock = false           # Memory clock frequency (MHz)
+gpu_util = false            # GPU utilization (%)
+mem_util = false            # Memory utilization (%)
+fb_used = false             # Framebuffer used (MiB)
+fb_free = false             # Framebuffer free (MiB)
+
+[system]
+# Enable system metrics collection (use node_exporter for these instead)
+enabled = false
+cpu_usage = false
+cpu_temp = false
+load_avg = false
+mem_total = false
+mem_used = false
+mem_free = false
+swap_used = false
+net_rx_bytes = false
+net_tx_bytes = false
+apt_upgradable = true       # Keep this one, it's useful
+
+[ipmi]
+# Enable IPMI metrics (requires ipmitool and /dev/ipmi0)
+enabled = false
+cpu_temp = false
+inlet_temp = false
+exhaust_temp = false
+fan_speed = false
+power_consumption = false

@@ -1,0 +1,68 @@
+[package]
+name = "dc-exporter"
+version = "0.2.7"
+edition = "2021"
+authors = ["CryptoLabs ZA"]
+description = "GPU metrics exporter for Prometheus - VRAM temp, hotspot temp, throttle reasons"
+license = "MIT"
+repository = "https://github.com/cryptolabsza/dc-exporter-rs-public"
+keywords = ["gpu", "nvidia", "prometheus", "monitoring", "metrics"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[dependencies]
+# NVML bindings for GPU metrics
+nvml-wrapper = "0.10"
+
+# Memory-mapped I/O for direct register access
+memmap2 = "0.9"
+
+# Async runtime for HTTP server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+
+# HTTP server
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# System info
+hostname = "0.4"
+libc = "0.2"
+
+# Timeout handling
+crossbeam-channel = "0.5"
+
+# TUI (Terminal UI) - like nvtop
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Time formatting
+chrono = "0.4"
+
+# Base64 for QEMU guest agent response decoding
+base64 = "0.22"
+
+# JSON parsing for VM metrics
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[profile.dev]
+opt-level = 1
