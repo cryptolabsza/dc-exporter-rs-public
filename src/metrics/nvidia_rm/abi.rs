@@ -12,13 +12,49 @@ pub const THERMAL_POLL_MASK: u64 = 0x10;
 pub const SEQ_START: u64 = 0xff00_0000_0000_0000;
 pub const MAX_DEVICES: usize = 32;
 
-pub fn mapping_length(page_size: usize) -> Option<usize> {
-    if !page_size.is_power_of_two() {
-        return None;
+/// Complete shared-data sizes from the separately pinned 590, 595 and 615 headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbiProfile {
+    pub driver_version: &'static str,
+    pub shared_size: usize,
+}
+
+pub fn profile_for_driver(driver_version: &str) -> Option<AbiProfile> {
+    match driver_version {
+        "590.48.01" => Some(AbiProfile {
+            driver_version: DRIVER_VERSION,
+            shared_size: RUSD_SIZE,
+        }),
+        "595.99.02" => Some(AbiProfile {
+            driver_version: "595.99.02",
+            shared_size: 3152,
+        }),
+        "615.71.09" => Some(AbiProfile {
+            driver_version: "615.71.09",
+            shared_size: 3184,
+        }),
+        _ => None,
     }
-    RUSD_SIZE
-        .checked_add(page_size - 1)
-        .map(|s| s & !(page_size - 1))
+}
+
+impl AbiProfile {
+    pub fn is_valid(self) -> bool {
+        profile_for_driver(self.driver_version) == Some(self)
+    }
+
+    pub fn mapping_length(self, page_size: usize) -> Option<usize> {
+        if !self.is_valid() || !page_size.is_power_of_two() {
+            return None;
+        }
+        self.shared_size
+            .checked_add(page_size - 1)
+            .map(|s| s & !(page_size - 1))
+    }
+}
+
+/// Compatibility wrapper for the original exact 590 fixture.
+pub fn mapping_length(page_size: usize) -> Option<usize> {
+    profile_for_driver(DRIVER_VERSION)?.mapping_length(page_size)
 }
 
 /// Linux asm-generic/x86 ioctl encoding, deliberately independent of host libc macros.

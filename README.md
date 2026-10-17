@@ -1,62 +1,81 @@
-# DC Exporter (Rust)
+# CryptoLabs DC Exporter
 
-Linux GPU metrics exporter for Prometheus, with an HTTP endpoint, one-shot output
-and a terminal UI. It collects NVML metrics, PCIe errors, VM passthrough state,
-and optional memory/hotspot temperatures.
+GPU metrics for Prometheus, built by [CryptoLabs](https://www.cryptolabs.co.za/).
+DC Exporter is a Linux exporter with an HTTP endpoint, one-shot collection and a
+terminal UI. It combines NVIDIA telemetry, GPU recovery diagnostics, PCIe error
+observations, VM passthrough state and optional memory/hotspot temperatures.
 
-The development tree is version **0.2.7**. `legacy` is the default thermal policy.
-RTX 5090 RUSD memory telemetry is **opt-in and experimental**; real-card accuracy,
-permissions, cleanup, workload noninterference and Linux/Windows comparison remain
-pending. Software tests do not establish hardware support.
+For help investigating GPU server failures, explore [CryptoLabs AI SRE](https://www.cryptolabs.co.za/services/).
+Our SRE agent collects diagnostic evidence and proposes a fix plan for operator
+review. The exporter itself does not reset GPUs, reboot hosts or change workloads.
 
-## Downloads and source
+## Source and downloads
 
-- [Stable binaries and DEB packages](https://github.com/cryptolabsza/dc-exporter-releases/releases)
-- [Development artifacts](https://github.com/cryptolabsza/dc-exporter-releases/releases/tag/dev-latest)
-- [Source](https://github.com/cryptolabsza/dc-exporter-rs-public)
+- [Source and issues](https://github.com/cryptolabsza/dc-exporter-rs-public)
+- [Binaries and DEB packages](https://github.com/cryptolabsza/dc-exporter-releases/releases)
+- [Development channel](https://github.com/cryptolabsza/dc-exporter-releases/releases/tag/dev-latest)
 
-Existing stable assets have their original provenance. They are not evidence of
-RTX 5090 acceptance or builds from the fresh source history.
+The development tree remains version **0.2.7**. Existing stable **0.2.8** assets
+retain their historical provenance; they are not builds of this fresh source
+history. Use the source commit, artifact hash and build provenance to identify a
+candidate, rather than comparing these version strings alone.
 
-## Build and verify
+## GPU temperatures
 
-Linux x86-64 is the runtime target. CI pins Rust 1.88.0 and native Debian 12;
-release artifacts must not import GLIBC symbols newer than 2.34.
+Core telemetry comes from NVML. Memory and hotspot availability depends on the
+GPU, driver, backend and device permissions. Unsupported readings are explicit;
+a zero temperature value alone does not mean that a measurement succeeded.
+
+| Memory backend | Behavior |
+| --- | --- |
+| `legacy` | Default. Existing permitted BAR/guest paths; RTX 50-series BAR access is disabled. |
+| `nvml` | Read the exact NVML memory-temperature field; no silent fallback. |
+| `rusd` | Experimental NVIDIA shared-data memory sensor; no BAR fallback. |
+| `auto` | Try NVML, then an eligible RUSD profile and permitted legacy reading only on explicit unsupported results. |
+| `off` | Suppress memory temperature collection, including guests. |
+
+The experimental RUSD profiles are **Linux x86-64, RTX 5090 PCI device `0x2b85`,
+and exact NVIDIA drivers `590.48.01`, `595.99.02` or `615.71.09`**. Unknown,
+adjacent or suffixed versions fail closed. This does not mean “590 and newer.”
+
+| Exact driver | Evidence available for this candidate |
+| --- | --- |
+| `590.48.01` | Limited authorized idle functional reads were observed. |
+| `595.99.02` | Source/layout checks exist; loaded-driver functional evidence has not been verified for this publication record. |
+| `615.71.09` | Fresh deployed memory readings were observed on operational GPUs. |
+
+These observations do not establish independent sensor accuracy, completed
+GPU Burn/NCCL qualification, every board/firmware combination, or full workload
+noninterference. RUSD remains opt-in. See [thermal methods](docs/gpu-thermal-support.md),
+[ABI provenance](docs/gpu-thermal-abi.md) and the [acceptance procedure](docs/validation/rtx5090-acceptance.md).
+
+## Run
+
+The default HTTP port is **9835**. The listener binds all interfaces; use the
+host's network policy to restrict access to trusted monitoring systems.
 
 ```sh
-git clone https://github.com/cryptolabsza/dc-exporter-rs-public.git
-cd dc-exporter-rs-public
-cargo +1.88.0 build --release
-./target/release/dc-exporter --version
-./target/release/dc-exporter --help
-```
-
-See [TESTING.md](TESTING.md) for hardware-free checks and the separately authorized
-[RTX 5090 lab acceptance procedure](docs/validation/rtx5090-acceptance.md).
-
-## Run on an authorized GPU system
-
-```sh
-# HTTP metrics server; default port 9835 and default legacy thermal policy
-./target/release/dc-exporter --port 9835
+# Keep NVML telemetry while disabling direct BAR register access.
+dc-exporter-rs --no-register-access --port 9835
 curl http://localhost:9835/metrics
 
-# Collect once, or use the terminal UI
-./target/release/dc-exporter --one-shot
-./target/release/dc-exporter --tui
+# One-shot collection or terminal UI on an authorized GPU system.
+dc-exporter-rs --no-register-access --one-shot
+dc-exporter-rs --no-register-access --tui
 
-# Disable BAR register access while retaining NVML telemetry
-./target/release/dc-exporter --no-register-access
+# Explicit experimental RUSD selection on an eligible authorized system.
+dc-exporter-rs --no-register-access --vram-backend rusd
 ```
 
-The HTTP listener binds all interfaces. Restrict exposure through the host's
-network policy. TUI keys include arrows/Tab to select GPUs, Enter for details,
-Space to pause and `q` to quit.
+The release executable is `dc-exporter-rs`; Cargo's executable is `dc-exporter`.
+The DEB package and systemd service are `dc-exporter-rs` and
+`dc-exporter.service`. Review the packaged service and required device permissions
+before installation. RUSD does not require `/dev/mem`; legacy BAR access has its
+own privileged-access requirements.
 
-The optional thermal controls are `--vram-backend legacy|auto|nvml|rusd|off`,
-`--thermal-timeout-ms` and `--thermal-max-sample-age-ms`. Explicit thermal CLI
-options override `[thermal]` in the configuration file in every mode. Other
-existing TOML sections retain their CLI-controlled behavior.
+Only `[thermal]` values are currently applied from the TOML configuration file;
+other existing sections retain CLI-controlled behavior. Explicit thermal CLI
+arguments override TOML in HTTP, one-shot and TUI modes.
 
 ```toml
 [thermal]
@@ -65,67 +84,50 @@ timeout_ms = 2000
 # max_sample_age_ms = 30000
 ```
 
-`auto` tries the exact NVML memory field, then the supported RUSD candidate only
-on explicit unsupported, then a permitted legacy reading. Permission, device-loss,
-invalid and stale results stop fallback. `rusd` uses RUSD only; `nvml` uses the
-exact NVML memory field only; `off` suppresses VRAM telemetry, including guests.
-RUSD is limited to NVIDIA driver **590.48.01**, PCI device **0x2b85** and Linux
-x86-64. Unknown profiles fail closed. Neither optional method adds hotspot
-support or needs `/dev/mem` or a kernel-parameter change.
+## Interpret GPU health
 
-Legacy BAR temperature reads require permitted `/dev/mem` mapping on supported
-GPUs. Changing kernel permissions or `iomem` settings is an administrator's
-separate decision. RTX 50-series legacy register access remains disabled.
+A GPU can return readable temperatures while requiring recovery. The exporter
+reports current native recovery actions and fixed numeric NVML/Xid diagnostics
+alongside the established `GPU_ERROR_STATE` values:
 
-## Metrics and limitations
+| Value | Meaning |
+| --- | --- |
+| `0` | Unknown or insufficient current evidence. |
+| `1` | Existing nominal/warning mapping. |
+| `2` | Essential query failure, GPU lost, reset required or valid nonzero recovery action. |
+| `3` | VM passthrough classification. |
+| `5` | Independently established hardware/PCI/proc failure or an active terminal-Xid latch. |
 
-The endpoint retains established metric names and labels, including:
+Recovery-required or unknown host GPUs are excluded from usable count and thermal
+probing. A recovery action is evidence of a driver condition, not proof of
+permanent damage or an RMA requirement. Numeric Xids describe the currently read
+kernel-log snapshot, not a complete lifetime error history. See [GPU health diagnostics](docs/gpu-health.md).
 
-- `DCXP_FI_DEV_VRAM_TEMP` and `DCXP_FI_DEV_HOT_SPOT_TEMP` in Celsius.
-- `DCXP_FI_DEV_VRAM_TEMP_VALID`: one for a valid current memory measurement.
-- `DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO`: selected backend and status labels.
-- `DCXP_GPU_SUPPORTED`: one for current measured, non-approximated memory data.
-- `dc_exporter_build_info`: version, build timestamp and source hash.
+Useful memory metrics include `DCXP_FI_DEV_VRAM_TEMP`,
+`DCXP_FI_DEV_VRAM_TEMP_VALID` and `DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO`.
+Use validity/status together with the scalar. Build identity is exposed through
+`dc_exporter_build_info`; artifact SHA-256 remains the exact executable identity.
 
-An unavailable scalar temperature remains zero. Use validity/status alongside
-it to distinguish failure from measured zero. The optional helper has a bounded
-parent deadline and one active child; a kernel-blocked child can survive a kill
-request. Existing global NVML, VM and system collection is not made bounded by
-this feature. Passthrough and noninterference claims need actual environment
-acceptance. See [thermal methods](docs/gpu-thermal-support.md) and
-[pinned ABI provenance](docs/gpu-thermal-abi.md).
+Optional thermal collection uses a bounded helper. Existing global NVML, VM and
+system collectors are not all bounded by that helper deadline; a successful HTTP
+scrape alone does not prove that the underlying collection is current.
 
-## Install and operate
+## Build and contribute
 
-Download the binary or DEB from the release repository, verify its published
-SHA-256 and provenance, and install it under your own change-control policy.
-The binary package name is `dc-exporter-rs`; the built Cargo binary is
-`dc-exporter`. The packaged service is `dc-exporter.service`.
+Official candidates must be built from reviewed protected refs through CryptoLabs'
+shared runner pool. Public fork and unreviewed PR code must not execute on the
+trusted pool or receive organization secrets. Release verification targets Linux
+x86-64, the pinned Rust toolchain and the GLIBC 2.34 import ceiling.
 
-```sh
-sudo dpkg -i dc-exporter-rs_VERSION_amd64.deb
-sudo systemctl status dc-exporter
-journalctl -u dc-exporter -n 50
-curl http://localhost:9835/metrics
-```
+See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md) and
+[RELEASING.md](RELEASING.md). Development changes go to `dev`, tests precede
+implementation, and the dev version stays unchanged. Version bumps accompany an
+accepted merge to `main`.
 
-The supplied service runs with the permissions needed by legacy register access.
-Review that service before installing it; NVML/RUSD device permissions are a
-separate requirement. Do not deploy test candidates to client workloads.
+## License and security
 
-## Contributing and releases
-
-Write a focused failing test before implementation, keep changes on `dev`, and
-leave the dev version unchanged. Version bumps occur only when merging an
-accepted release to `main`. See [RELEASING.md](RELEASING.md).
-
-Public PR/fork code is not admitted to persistent self-hosted runners. Trusted
-builds and bytes-only publication require reviewed protected refs and verified
-runner/secret policy. See [public snapshot and publication](docs/public-publishing.md).
-
-## License
-
-The project declares MIT; see [LICENSE](LICENSE). Adapted NVIDIA and Philip
-Langdale definitions retain their notices in [ABI provenance](docs/gpu-thermal-abi.md).
-The legacy register implementation is preserved; its disclosure/provenance
-review is a separate owner gate before public visibility.
+CryptoLabs' project code is MIT licensed; see [LICENSE](LICENSE). Adapted NVIDIA
+and Philip Langdale definitions retain their notices and exact source pins in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and [ABI provenance](docs/gpu-thermal-abi.md).
+Dependencies retain their own licenses. See [SECURITY.md](SECURITY.md) for private
+vulnerability reporting.

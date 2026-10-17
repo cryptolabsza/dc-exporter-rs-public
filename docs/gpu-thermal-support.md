@@ -11,7 +11,7 @@ The development build adds opt-in aggregate memory temperature. `legacy` remains
 | `rusd` | NVIDIA RM shared-data memory entry only; no NVML or BAR fallback. |
 | `off` | Explicitly suppress VRAM temperature on hosts and guests; keep core and hotspot collection. |
 
-NVML per-field permission, invalidity, device loss and stale results stop fallback. RUSD is limited to Linux x86-64, NVIDIA `590.48.01`, PCI device `0x2b85`. Other profiles are unsupported. The candidate remains subject to the [real-card acceptance procedure](validation/rtx5090-acceptance.md) and the [pinned public ABI provenance](gpu-thermal-abi.md). No live acceptance result is claimed.
+NVML per-field permission, invalidity, device loss and stale results stop fallback. RUSD is limited to Linux x86-64, NVIDIA exact `590.48.01`, `595.99.02` or `615.71.09`, PCI device `0x2b85`. Adjacent versions, suffixed versions and unknown 6xx profiles are unsupported. The candidate remains subject to the [real-card acceptance procedure](validation/rtx5090-acceptance.md) and the [pinned public ABI provenance](gpu-thermal-abi.md). The separately authorized 590 idle smoke returned 14 valid readings across seven cards in two serial passes (34–36°C), with clean helper exits and unchanged observed GPU error/idle state. Independent accuracy, raw comparison, full integration, GPU Burn/NCCL qualification and soak remain pending. Loaded-driver evidence for595 has not been verified for this publication record. Fresh deployed functional memory readings exist for615 on operational GPUs; these observations do not establish full accuracy or workload noninterference. No full hardware acceptance result is claimed.
 
 ```toml
 [thermal]
@@ -33,3 +33,5 @@ The optional batch deadline includes parent pipe I/O and waiting for successful 
 Existing scalar names and labels remain intact, including the established zero failure sentinel. `DCXP_FI_DEV_VRAM_TEMP_VALID` distinguishes unavailable zero from a measured zero. `DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO` exposes finite `backend` and `status` labels. `DCXP_GPU_SUPPORTED` is one only for a current valid, non-approximated memory measurement; the old datacenter placeholder zero is unsupported. TUI detail shows the selected method and status.
 
 Development publication retains version `0.2.7` and default `legacy`. Stable main/tag/release promotion waits for accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
+
+Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; devversion0.2.7 and defaultlegacy are preserved.

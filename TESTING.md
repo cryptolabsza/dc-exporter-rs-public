@@ -1,69 +1,76 @@
-# Testing DC Exporter
+# Testing CryptoLabs DC Exporter
 
-## Hardware-free verification
+Official build candidates use CryptoLabs' shared runner pool. Reviewed protected
+`dev` and `main` pushes and manual dispatches are the only trusted inputs. Forks,
+PR heads and unreviewed refs do not execute on this pool. Maintainers admit a
+reviewed protected commit after reviewing contributor changes.
 
-Use Linux x86-64 and Rust 1.88.0 for the release target. Run the following checks
-without GPU devices, `/dev/mem`, privileged sockets, sudo or unrelated credentials:
+## Hardware-free checks
+
+The pinned recipe uses Rust 1.88.0 in a Debian Bookworm image pinned by digest,
+Linux x86-64, an ordinary container UID, two CPUs, 3 GiB memory and 256 PIDs. It
+drops all capabilities, disables privilege gains and mounts only the disposable
+guest source directory. The Docker daemon belongs to that ephemeral guest.
+No host socket, keys or GPU devices enter the build container.
+
+The job runs the Python boundary/export/notice tests, then the pinned driver-free
+C layout assertions for exact NVIDIA `590.48.01`, `595.99.02` and `615.71.09` before
+any Cargo command. It resolves the locked Linux default-feature dependency graph,
+collects actual licence files, runs locked all-target release tests, and builds.
+Only `test_collector_creation` and `test_timeout_behavior` are filtered, including
+their integration-suite copies: these two existing tests require live NVML.
+All other tests remain enabled. The build never uses `--ignored` to hide failures.
+
+`--version` and `--help` execute without GPU discovery. HELP must retain `--tui`
+and `--vram-backend`. The GLIBC import ceiling is 2.34. Neither a GPU collection
+smoke nor package installation occurs in CI.
+
+The Python checks can be run independently without compiling Rust or C:
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
-cargo +1.88.0 test --release --all-targets -- \
-  --skip test_collector_creation --skip test_timeout_behavior
-cargo +1.88.0 build --release
-./target/release/dc-exporter --version
-./target/release/dc-exporter --help
 ```
 
-Only two existing live-NVML tests are skipped, including their copies compiled
-into integration suites: `test_collector_creation` and `test_timeout_behavior`.
-They call live collector/availability paths and require separate lab authorization.
-All pure tests and child fixtures remain enabled. `--version`/`--help` avoid GPU
-inventory and driver calls. CI requires `/usr/bin/python3` and native Debian 12;
-its artifact gate rejects GLIBC imports newer than 2.34.
+The thermal policy/worker and NVIDIA RM suites exercise deadlines, malformed
+frames, identity, concurrency, fallback, sequence decoding and cleanup without
+GPU calls. The two hardware-test filters do not establish any hardware result.
 
-The thermal policy/worker and NVIDIA RM suites check deadlines, malformed frames,
-identity, concurrency, fallback, sequence decoding and cleanup without GPU calls.
-A real helper smoke test uses an unsupported profile and must exit before normal
-exporter startup. Reproduce pinned C layout assertions using
-[the public ABI fixture](docs/gpu-thermal-abi.md#software-verification-and-remaining-claims).
+## Notice and distribution verification
 
-The snapshot tests use isolated scratch Git repositories with signing and hooks
-disabled. They check commit-only selection, exact hashes/modes, complete code/test
-selection, explicit documentation/CI changes, private content, path/symlink
-rejection and absence of Git history. They do not prove live GitHub or VM policy.
+The source tree retains the project and adapted NVIDIA/Philip Langdale notices.
+The shared job uses `cargo metadata --locked --format-version 1 --filter-platform
+x86_64-unknown-linux-gnu` with default features and follows the non-dev resolved
+graph. Actual licence/attribution files are included for each selected dependency;
+missing package identities, graph nodes or unresolved licensing fail the build.
 
-## When an RTX 5090 candidate can be tested
+The separately uploaded notice evidence retains the exact Cargo metadata, target,
+feature selection, sanitized graph, selected inventory and file hashes. A fresh
+verifier must independently walk the actual filtered graph and compare the exact
+package-ID/name/version/source set to the emitted inventory. Inspect the resulting
+notice asset and confirm exact equality with both DEBs' copyright files.
+Synthetic licence fixtures are behavioral tests, never upstream licensing claims.
 
-A candidate is ready for a **separately authorized idle lab card** only after its
-exact Linux artifact passes software checks, independent review and profile/ABI
-checks, with a recorded rollback and operator permission. Pin NVIDIA driver
-**590.48.01**, PCI device **0x2b85**, Linux x86-64, full BDF/UUID, exporter hash and
-configuration. Other profiles must return unsupported.
+The distribution ZIP contains ten entries: the executable, both DEBs, BUILD_INFO,
+VERSION, HELP, SYMBOLS, notices, SHA256SUMS and manifest. The manifest hashes the
+other nine entries; SHA256SUMS has eight rows and excludes itself and the manifest.
+Each file is limited to 128 MiB; the complete archive contents to 200 MiB.
 
-Start with existing default `legacy` behavior and BAR access disabled, then opt
-into `rusd` or `auto` only on that lab card. Use an external operator timeout as
-well as the optional helper deadline. The helper deadline does not bound the
-existing global NVML/VM/system collectors or prove noninterference.
+Snapshot tests use isolated Git fixtures with signing and hooks disabled. They
+verify immutable blob/mode selection, explicit per-file change approvals, complete
+source/test selection, secret markers, path/symlink rejection and no Git history.
+These tests do not prove effective GitHub admission or actual guest isolation.
 
-```sh
-# On the authorized lab system only; use the exact reviewed candidate path.
-timeout 15s ./dc-exporter --one-shot --no-register-access --vram-backend legacy
-# Only after the baseline is accepted for that lab session:
-timeout 15s ./dc-exporter --one-shot --no-register-access \
-  --vram-backend rusd --thermal-timeout-ms 2000
-```
+## Hardware acceptance remains separate
 
-Collect expected/actual results, current validity/status and same-card comparison.
-Follow the full [RTX 5090 acceptance procedure](docs/validation/rtx5090-acceptance.md)
-for repeated steady states, soak, permissions, cleanup, controlled unbind and
-Linux/Windows evidence. Inconclusive evidence keeps acceptance held. One-shot
-success alone does not authorize service installation, stable release or client
-workload testing.
+RUSD remains opt-in for RTX 5090 PCI device `0x2b85`, Linux x86-64 and only the
+three exact drivers above. Unknown, adjacent and suffixed versions fail closed.
+Limited functional reads exist for 590 and deployed 615; the publication record
+has not verified loaded-driver evidence for 595. Independent sensor accuracy,
+complete GPU Burn/NCCL qualification and full workload noninterference remain
+unaccepted. See [thermal methods](docs/gpu-thermal-support.md) and the separately
+authorized [lab procedure](docs/validation/rtx5090-acceptance.md).
 
-## Production boundary
-
-Client/production hosts are excluded. Do not reboot, deploy candidates, change
-workloads/services/drivers, run new probes or issue RM controls there. Do not
-repeat the blocked sysfs `driver_override` read. Only separately approved lab
-work may exercise driver interaction, load, unbind or OS comparison; preserve
-resource/quiescence and rollback evidence. No actual-card acceptance is claimed.
+Do not deploy candidates, reset/reboot GPUs, alter drivers or workloads, or run
+new probes on production/client systems as part of software verification. A
+successful scrape or one-shot collection does not establish hardware health,
+collector freshness or permission for a stress test.

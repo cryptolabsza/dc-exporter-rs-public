@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=public-snapshot-abi-allowlist-verification; req=REQ-PUB-007; trace=TRACE-PUB-007; ver=VER-PUB-007
+# TRACEWEAVER: verifies=VER-PUB-007; req=REQ-PUB-007; trace=TRACE-PUB-007
 # TRACEWEAVER: file-role=public-snapshot-fixtures; req=REQ-PUB-002; trace=TRACE-PUB-002; ver=VER-PUB-002
 # TRACEWEAVER: verifies=VER-PUB-002; req=REQ-PUB-002; trace=TRACE-PUB-002
 """Offline public-snapshot acceptance fixtures; all Git mutations use scratch repos."""
@@ -83,6 +85,58 @@ class PublicExportTests(unittest.TestCase):
     def rejected(self, action):
         with self.assertRaises(self.exporter.ExportError):
             action()
+
+    def test_gpu_health_document_is_the_only_new_health_public_path(self):
+        self.assertIn("docs/gpu-health.md", self.exporter.PUBLIC_PATHS)
+        self.assertIn("docs/gpu-health.md", self.exporter.REVIEWED_CHANGE_PATHS)
+        for private in ("docs/validation/gpu-health-acceptance.md", ".traceweaver/gpu-health-2026-10-14/plan.md", "docs/gpu-health-private.md"):
+            self.assertNotIn(private, self.exporter.PUBLIC_PATHS)
+        self.put("docs/gpu-health.md", "# GPU health\nRecovery observations do not establish physical damage.\n")
+        commit = self.commit()
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        approval = self.approve(commit, {"docs/gpu-health.md": "Reviewed additive health metrics documentation"})
+        self.export(commit, approval)
+        self.assertEqual((self.output / "docs/gpu-health.md").read_text(), (self.repo / "docs/gpu-health.md").read_text())
+
+    def test_driver_free_abi_adds_exact_public_paths(self):
+        added = {"scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json",
+                 "tests/test_ci_rusd_abi.py"}
+        baseline = frozenset("""
+.github/workflows/build.yml .gitignore Cargo.toml Cargo.lock LICENSE Makefile README.md
+RELEASING.md TESTING.md build.rs config.toml.example
+docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md
+docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
+scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
+scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
+src/config.rs src/main.rs src/safe_nvml.rs src/state.rs
+src/metrics/collector.rs src/metrics/dmesg.rs src/metrics/gpu.rs src/metrics/mod.rs
+src/metrics/nvidia_rm/abi.rs src/metrics/nvidia_rm/mod.rs src/metrics/nvidia_rm/rusd.rs
+src/metrics/pci.rs src/metrics/prometheus.rs src/metrics/register.rs
+src/metrics/thermal.rs src/metrics/thermal_worker.rs src/metrics/vm.rs
+src/tui/app.rs src/tui/mod.rs src/tui/ui.rs systemd/dc-exporter.service
+tests/nvidia_rm_abi.rs tests/nvidia_rm_rusd.rs tests/release_workflow.rs
+tests/thermal_policy.rs tests/thermal_worker.rs tests/test_public_export.py
+tests/test_ci_build.py tests/test_ci_publisher.py
+""".split())
+        pool_paths = {".github/workflows/ci-pool-build-recipe.yml", "scripts/ci/pool-build.sh",
+                      "scripts/ci/pool_manifest.py", "scripts/ci/notice_inventory.py",
+                      "tests/test_pool_workflow.py", "tests/test_ci_notices.py",
+                      "CONTRIBUTING.md", "SECURITY.md", "THIRD-PARTY-NOTICES.md"}
+        self.assertEqual(self.exporter.PUBLIC_PATHS, baseline | added | pool_paths | {"docs/gpu-health.md"})
+        self.assertTrue(added.issubset(self.exporter.REVIEWED_CHANGE_PATHS))
+
+    def test_driver_free_abi_files_require_reviewed_hashes_and_export_exactly(self):
+        added = {"scripts/ci/rusd_abi.py": "# pinned public ABI helper fixture\n",
+                 "scripts/ci/rusd-headers.json": '{"fixture":"pinned headers"}\n',
+                 "tests/test_ci_rusd_abi.py": "# pinned ABI test fixture\n"}
+        for name, content in added.items():
+            self.put(name, content)
+        commit = self.commit()
+        approval = self.approve(commit, {name: "Reviewed driver-free ABI check" for name in added})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        self.export(commit, approval)
+        for name in added:
+            self.assertEqual((self.output / name).read_bytes(), self.git("show", commit + ":" + name))
 
     def test_exports_only_approved_commit_blobs_and_modes(self):
         manifest = self.export()

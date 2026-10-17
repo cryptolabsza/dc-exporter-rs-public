@@ -243,7 +243,9 @@ pub fn eligible_host(gpu: &GpuMetrics) -> bool {
         && normalize_bdf(&gpu.pci_bus_id).is_some()
 }
 pub fn eligible_for_rusd(gpu: &GpuMetrics) -> bool {
-    eligible_host(gpu) && gpu.device_id == 0x2b85 && gpu.driver_version == "590.48.01"
+    eligible_host(gpu)
+        && gpu.device_id == 0x2b85
+        && super::nvidia_rm::abi::profile_for_driver(&gpu.driver_version).is_some()
 }
 fn same_identity(bdf: &str, uuid: &str, gpu: &GpuMetrics) -> bool {
     normalize_bdf(bdf).is_some()

@@ -129,7 +129,13 @@ impl BootHardwareEvidence {
 struct HardwareEvidenceTracker {
     last_successful_by_source:
         HashMap<super::dmesg::DmesgSource, HashMap<String, BootHardwareEvidence>>,
+    // Original source-token counts must not collide after PCI projection: an
+    // old functionless79 and a new full-BDF79 are distinct observed events.
+    last_raw_by_source:
+        HashMap<super::dmesg::DmesgSource, HashMap<String, BootHardwareEvidence>>,
+    canonicalized_sources: HashSet<super::dmesg::DmesgSource>,
     latched_failure_reasons: HashMap<String, String>,
+    unresolved_current_health: HashMap<(String,String),GpuState>,
 }
 
 impl HardwareEvidenceTracker {
@@ -150,8 +156,9 @@ impl HardwareEvidenceTracker {
             return;
         }
 
-        self.last_successful_by_source
-            .insert(source, terminal_evidence_snapshot(dmesg_errors));
+        let snapshot=terminal_evidence_snapshot(dmesg_errors);
+        self.last_raw_by_source.entry(source).or_insert_with(||snapshot.clone());
+        self.last_successful_by_source.insert(source,snapshot);
     }
 
     fn observe_terminal_evidence(
@@ -165,6 +172,12 @@ impl HardwareEvidenceTracker {
         let Some(source) = dmesg_errors.source else {
             return self.latched_failure_reasons.get(pci_bus_id).cloned();
         };
+
+        // Canonicalized production snapshots have already compared ORIGINAL
+        // source-token counts. Merged per-GPU presentation is not event authority.
+        if self.canonicalized_sources.contains(&source) {
+            return self.latched_failure_reasons.get(pci_bus_id).cloned();
+        }
 
         if !self.last_successful_by_source.contains_key(&source) {
             self.initialize_baseline(dmesg_errors);
@@ -240,35 +253,174 @@ fn terminal_boot_hardware_evidence(
 /// Any essential NVML failure is invalidated immediately; a changed terminal
 /// evidence fingerprint or a current /proc failure upgrades even an otherwise
 /// successful NVML record to a hardware failure.
-fn reconcile_nvml_hardware_evidence(
-    mut gpu: GpuMetrics,
-    pci_gpu: &PciGpuInfo,
-    dmesg_errors: &super::dmesg::DmesgGpuErrors,
-    evidence_tracker: &mut HardwareEvidenceTracker,
-) -> GpuMetrics {
-    let hardware_failure_reason =
-        active_hardware_failure_reason(pci_gpu, dmesg_errors, evidence_tracker);
-
-    if !gpu.nvml_essential_query_failed && hardware_failure_reason.is_none() {
-        return gpu;
+/// Reconcile verified identities without manufacturing another physical GPU row.
+/// A missing native BDF can join only by a unique verified /proc UUID; an
+/// ambiguous/conflicting identity remains diagnostics-only, never index-joined.
+fn reconcile_nvml_inventory(records:Vec<GpuMetrics>,inventory:&[PciGpuInfo])->(HashMap<String,GpuMetrics>,Vec<super::gpu::UnmatchedNvmlError>) {
+    let mut bdf_counts=HashMap::<String,usize>::new();let mut uuid_counts=HashMap::<String,usize>::new();
+    for gpu in &records {
+        if !gpu.pci_bus_id.is_empty() {*bdf_counts.entry(gpu.pci_bus_id.clone()).or_default()+=1;}
+        if !gpu.uuid.is_empty() {*uuid_counts.entry(gpu.uuid.clone()).or_default()+=1;}
     }
-
-    clear_volatile_gpu_telemetry(&mut gpu);
-    gpu.state = GpuState::Error;
-
-    if let Some(dmesg_info) = dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
-        gpu.dmesg_hardware_failure = dmesg_info.is_hardware_failure;
-        gpu.dmesg_rm_init_failed = dmesg_info.rm_init_adapter_failed;
-        gpu.fallen_off_bus = dmesg_info.fallen_off_bus;
-        gpu.xid_errors = dmesg_info.xid_errors.clone();
+    let mut proposed=Vec::new();let mut target_counts=HashMap::<String,usize>::new();
+    for gpu in records {
+        let target=if !gpu.pci_bus_id.is_empty() {
+            let matches:Vec<_>=inventory.iter().filter(|pci|pci.pci_bus_id==gpu.pci_bus_id).collect();
+            let unique_native_uuid=gpu.uuid.is_empty() || uuid_counts.get(&gpu.uuid)==Some(&1);
+            let proc_agrees=matches.len()==1 && matches[0].proc_health.as_ref().and_then(|health|health.uuid.as_deref()).filter(|uuid|!uuid.is_empty()).is_none_or(|uuid|gpu.uuid.is_empty() || uuid==gpu.uuid);
+            let uuid_targets:Vec<_>=inventory.iter().filter(|pci|!gpu.uuid.is_empty() && pci.proc_health.as_ref().and_then(|health|health.uuid.as_deref())==Some(gpu.uuid.as_str())).collect();
+            let no_cross_card_uuid=uuid_targets.is_empty() || (uuid_targets.len()==1 && uuid_targets[0].pci_bus_id==gpu.pci_bus_id);
+            (bdf_counts.get(&gpu.pci_bus_id)==Some(&1) && matches.len()==1 && unique_native_uuid && proc_agrees && no_cross_card_uuid).then(||gpu.pci_bus_id.clone())
+        } else if !gpu.uuid.is_empty() && uuid_counts.get(&gpu.uuid)==Some(&1) {
+            let matches:Vec<_>=inventory.iter().filter(|pci|pci.proc_health.as_ref().and_then(|health|health.uuid.as_deref())==Some(gpu.uuid.as_str())).collect();
+            (matches.len()==1 && inventory.iter().filter(|pci|pci.pci_bus_id==matches[0].pci_bus_id).count()==1).then(||matches[0].pci_bus_id.clone())
+        } else {None};
+        if let Some(target)=&target {*target_counts.entry(target.clone()).or_default()+=1;}
+        proposed.push((target,gpu));
     }
-
-    if let Some(reason) = hardware_failure_reason {
-        gpu.state = GpuState::HardwareFailure;
-        gpu.hardware_failure_reason = Some(reason);
+    let mut joined=HashMap::new();let mut diagnostics=Vec::new();
+    for (target,mut gpu) in proposed {
+        if let Some(target)=target.filter(|target|target_counts.get(target)==Some(&1)) {
+            gpu.pci_bus_id=target.clone();joined.insert(target,gpu);
+        } else {
+            if gpu.nvml_errors.is_empty() {gpu.nvml_errors.push(super::gpu::NvmlQueryError{query:"pci_info",error:"invalid_data",code:None});}
+            for error in gpu.nvml_errors {
+                diagnostics.push(super::gpu::UnmatchedNvmlError{index:gpu.index,uuid:gpu.uuid.clone(),pci_bus_id:gpu.pci_bus_id.clone(),name:gpu.name.clone(),driver_version:gpu.driver_version.clone(),error,recovery:gpu.recovery.clone()});
+            }
+        }
     }
+    (joined,diagnostics)
+}
 
+/// A unique verified UUID may retain unresolved current evidence before BDF is
+/// available. Ambiguous UUIDs and anonymous enumeration failures never bind it.
+fn observe_unmatched_current_health(diagnostics:&[super::gpu::UnmatchedNvmlError],tracker:&mut HardwareEvidenceTracker) {
+    let mut identities=HashMap::<&str,HashSet<(u32,&str)>>::new();
+    for record in diagnostics {
+        if !record.uuid.is_empty() {identities.entry(&record.uuid).or_default().insert((record.index,&record.pci_bus_id));}
+    }
+    let mut observed=HashSet::new();
+    for record in diagnostics {
+        if record.uuid.is_empty() || !record.pci_bus_id.is_empty() || identities.get(record.uuid.as_str()).is_none_or(|ids|ids.len()!=1) || !observed.insert(record.uuid.as_str()) {continue;}
+        let Some(recovery)=&record.recovery else {continue;};
+        let mut state=match recovery.status {
+            super::gpu::RecoveryStatus::Valid if recovery.action.is_some_and(|code|code>0)=>GpuState::Error,
+            super::gpu::RecoveryStatus::Valid|super::gpu::RecoveryStatus::Unsupported=>GpuState::Ok,
+            _=>GpuState::Unavailable,
+        };
+        for evidence in diagnostics.iter().filter(|d|d.uuid==record.uuid && d.index==record.index) {
+            let error=&evidence.error;
+            let candidate=if matches!(error.code,Some(15|16)) || matches!(error.query,"name"|"temperature"|"memory") {GpuState::Error}
+                else if matches!(error.error,"not_supported"|"function_not_found"|"symbol_unavailable"|"unsupported_slot") {GpuState::Ok}
+                else {GpuState::Unavailable};
+            if super::gpu::health_priority(candidate)>super::gpu::health_priority(state) {state=candidate;}
+        }
+        if recovery.status==super::gpu::RecoveryStatus::Unsupported {
+            for ((uuid,_),prior) in &tracker.unresolved_current_health {
+                if uuid==&record.uuid && super::gpu::health_priority(*prior)>super::gpu::health_priority(state) {state=*prior;}
+            }
+        } else {
+            // Supported current evidence replaces prior current-state uncertainty;
+            // the separate legacy terminal latch is intentionally untouched.
+            tracker.unresolved_current_health.retain(|(uuid,_),_|uuid!=&record.uuid);
+        }
+        if matches!(state,GpuState::Error|GpuState::Unavailable) {tracker.unresolved_current_health.insert((record.uuid.clone(),String::new()),state);}
+    }
+}
+
+/// Only unambiguous inventory identity may resolve a functionless kernel token.
+fn resolve_xid_pci_id(token:&str,inventory:&[PciGpuInfo])->Option<String> {
+    let canonical=super::dmesg::canonical_pci_token(token)?;
+    let matches:Vec<_>=inventory.iter().filter(|gpu| {
+        if canonical.len()==12 {gpu.pci_bus_id==canonical}
+        else {gpu.pci_bus_id.get(..10)==Some(canonical.as_str())}
+    }).collect();
+    (matches.len()==1).then(||matches[0].pci_bus_id.clone())
+}
+/// Compare terminal events by original source token, then project diagnostics
+/// only onto unambiguous PCI identity. Projection never supplies event counts.
+fn canonicalize_dmesg_inventory(errors:&mut super::dmesg::DmesgGpuErrors,inventory:&[PciGpuInfo],tracker:&mut HardwareEvidenceTracker) {
+    if errors.read_succeeded {
+        if let Some(source)=errors.source {
+            let current=terminal_evidence_snapshot(errors);
+            let mut next=current.clone();
+            if let Some(baseline)=tracker.last_raw_by_source.get(&source) {
+                for (token,evidence) in &current {
+                    if let Some(pci)=resolve_xid_pci_id(token,inventory) {
+                        if let Some(reason)=evidence.monotonic_escalation_reason_from(baseline.get(token).unwrap_or(&BootHardwareEvidence::default())) {
+                            tracker.latched_failure_reasons.entry(pci).or_insert(reason);
+                        }
+                    } else if let Some(previous)=baseline.get(token) {
+                        // Leave unresolved changes pending until identity resolves.
+                        next.insert(token.clone(),previous.clone());
+                    } else {
+                        next.remove(token);
+                    }
+                }
+            }
+            // Successful absence/rotation drops old tokens; failed reads never
+            // replace history. First reads of a new source establish its baseline.
+            tracker.last_raw_by_source.insert(source,next);
+            tracker.canonicalized_sources.insert(source);
+        }
+    }
+    let raw=std::mem::take(&mut errors.per_gpu);
+    for (token,info) in raw {
+        if let Some(pci)=resolve_xid_pci_id(&token,inventory) {
+            let entry=errors.per_gpu.entry(pci).or_default();
+            entry.rm_init_adapter_failed=entry.rm_init_adapter_failed.saturating_add(info.rm_init_adapter_failed);
+            entry.xid_errors.extend(info.xid_errors);entry.fallen_off_bus|=info.fallen_off_bus;
+            entry.is_hardware_failure|=info.is_hardware_failure;
+            if entry.failure_summary.is_none() {entry.failure_summary=info.failure_summary;}
+        }
+    }
+}
+
+fn reconcile_nvml_hardware_evidence(mut gpu:GpuMetrics,pci_gpu:&PciGpuInfo,dmesg_errors:&super::dmesg::DmesgGpuErrors,evidence_tracker:&mut HardwareEvidenceTracker)->GpuMetrics {
+    let hardware_failure_reason=active_hardware_failure_reason(pci_gpu,dmesg_errors,evidence_tracker);
+    gpu.xid_source=dmesg_errors.source;gpu.xid_source_read_succeeded=dmesg_errors.read_succeeded;
+    if let Some(info)=dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
+        gpu.dmesg_hardware_failure=info.is_hardware_failure;gpu.dmesg_rm_init_failed=info.rm_init_adapter_failed;
+        gpu.fallen_off_bus=info.fallen_off_bus;gpu.xid_errors=info.xid_errors.clone();
+    } else {gpu.xid_errors.clear();}
+    // Current recovery/query state is keyed by both verified identities, never index.
+    // Keep unresolved observations separate from the preexisting BDF terminal latch.
+    let identity=(!gpu.uuid.is_empty() && !gpu.pci_bus_id.is_empty()).then(||(gpu.uuid.clone(),gpu.pci_bus_id.clone()));
+    if gpu.recovery.is_some() && identity.is_none() && gpu.state!=GpuState::Error && gpu.state!=GpuState::HardwareFailure {gpu.state=GpuState::Unavailable;}
+    if let Some(identity)=identity {
+        let status=gpu.recovery.as_ref().map(|reading|reading.status);
+        match status {
+            Some(super::gpu::RecoveryStatus::Unsupported)=>{
+                for key in [&identity,&(identity.0.clone(),String::new())] {
+                    if let Some(prior)=evidence_tracker.unresolved_current_health.get(key) {
+                        if super::gpu::health_priority(*prior)>super::gpu::health_priority(gpu.state) {gpu.state=*prior;}
+                    }
+                }
+            }
+            Some(_)=>{evidence_tracker.unresolved_current_health.retain(|(uuid,_),_|uuid!=&identity.0);}
+            None=>{}
+        }
+        if gpu.recovery.is_some() && matches!(gpu.state,GpuState::Error|GpuState::Unavailable) {evidence_tracker.unresolved_current_health.insert(identity,gpu.state);}
+    }
+    if gpu.nvml_essential_query_failed {gpu.state=GpuState::Error;}
+    if let Some(reason)=hardware_failure_reason {gpu.state=GpuState::HardwareFailure;gpu.hardware_failure_reason=Some(reason);}
+    if !matches!(gpu.state,GpuState::Ok|GpuState::Warning) {clear_volatile_gpu_telemetry(&mut gpu);}
     gpu
+}
+
+fn enrich_pci_gpu_snapshot(gpu:&mut GpuMetrics,pci_gpu:&PciGpuInfo,dmesg_errors:&super::dmesg::DmesgGpuErrors) {
+    gpu.bound_driver=pci_gpu.bound_driver.clone();
+    gpu.device_id=pci_gpu.device_id;
+    // Numeric observations belong to independently identified PCI rows even when
+    // their current NVML handle, identity join, or operational telemetry fails.
+    // Enrichment does not classify the row or associate anonymous NVML errors.
+    if let Some(info)=dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
+        gpu.xid_errors=info.xid_errors.clone();
+        gpu.dmesg_rm_init_failed=info.rm_init_adapter_failed;
+        gpu.fallen_off_bus=info.fallen_off_bus;
+    }
+    gpu.xid_source=dmesg_errors.source;
+    gpu.xid_source_read_succeeded=dmesg_errors.read_succeeded;
 }
 
 /// Check for a current /proc failure or new/latched terminal dmesg evidence.
@@ -404,17 +556,15 @@ impl MetricsCollectorSync {
         let nvml_result = self.nvml_collector.collect_all();
         let nvml_gpus = nvml_result.gpus.len() as u32;
         let nvml_initialized = nvml_result.nvml_initialized;
+        let mut nvml_unmatched_errors=nvml_result.unmatched_errors;
         let driver_version = nvml_result.gpus.first()
             .map(|g| g.driver_version.clone())
             .unwrap_or_else(|| "unknown".to_string());
         
         debug!("NVML returned {} GPU records, initialized={}", nvml_gpus, nvml_initialized);
 
-        // Build NVML metrics map
-        let mut nvml_metrics: HashMap<String, GpuMetrics> = nvml_result.gpus
-            .into_iter()
-            .map(|g| (g.pci_bus_id.clone(), g))
-            .collect();
+        let (mut nvml_metrics,identity_diagnostics)=reconcile_nvml_inventory(nvml_result.gpus,&pci_gpus);
+        nvml_unmatched_errors.extend(identity_diagnostics);
 
         // Step 4: Collect VM metrics for GPUs passed through to VMs
         // This also identifies which PCI addresses are confirmed passthrough via virsh dumpxml
@@ -480,7 +630,12 @@ impl MetricsCollectorSync {
         }
 
         // Step 6: Parse dmesg for hardware failure signals (RmInitAdapter, XID, fallen off bus)
-        let dmesg_errors = parse_dmesg_gpu_errors();
+        let mut dmesg_errors = parse_dmesg_gpu_errors();
+        {
+            let mut tracker=self.hardware_evidence_tracker.lock().unwrap_or_else(|p|p.into_inner());
+            canonicalize_dmesg_inventory(&mut dmesg_errors,&pci_gpus,&mut tracker);
+            observe_unmatched_current_health(&nvml_unmatched_errors,&mut tracker);
+        }
         if !dmesg_errors.per_gpu.is_empty() {
             info!("Dmesg GPU errors found for {} GPUs", dmesg_errors.per_gpu.len());
         }
@@ -567,24 +722,9 @@ impl MetricsCollectorSync {
                 self.create_error_gpu(pci_index, pci_gpu, &driver_version)
             };
             
-            // Enrich all GPUs with driver binding info
-            gpu.bound_driver = pci_gpu.bound_driver.clone();
-            gpu.device_id = pci_gpu.device_id;
-            
-            // Even for GPUs that appear OK via NVML, check dmesg for warnings
-            if gpu.state == GpuState::Ok || gpu.state == GpuState::Warning {
-                if let Some(dmesg_info) = dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
-                    if !dmesg_info.xid_errors.is_empty() {
-                        gpu.xid_errors = dmesg_info.xid_errors.clone();
-                    }
-                    gpu.dmesg_rm_init_failed = dmesg_info.rm_init_adapter_failed;
-                    gpu.fallen_off_bus = dmesg_info.fallen_off_bus;
-                }
-            }
-            
+            enrich_pci_gpu_snapshot(&mut gpu,pci_gpu,&dmesg_errors);
             gpus.push(gpu);
         }
-
         // Step 6: Collect system metrics
         let apt_upgradable = count_apt_upgradable();
         AllMetrics {
@@ -596,6 +736,7 @@ impl MetricsCollectorSync {
             gpus,
             apt_upgradable,
             timestamp,
+            nvml_unmatched_errors,
         }
     }
 
@@ -1591,4 +1732,356 @@ mod tests {
             3
         );
     }
+
+    // VER-HEALTH-003/005: actual reconciliation -> actual formatter, no invented output.
+    #[test]
+    fn health_definition_nominal_reconciliation_retains_historical_154_without_fault() {
+        let bdf = "0000:61:00.0";
+        let mut history = successful_empty_dmesg();
+        history.per_gpu.insert(bdf.into(), GpuDmesgInfo { xid_errors: vec![154], ..Default::default() });
+        let mut tracker = HardwareEvidenceTracker::from_boot_log(&history);
+        let mut input = stale_nvml_gpu(bdf);
+        input.state = GpuState::Ok;
+        input.nvml_essential_query_failed = false;
+        let actual = reconcile_nvml_hardware_evidence(input,&pci_gpu(bdf),&history,&mut tracker);
+        assert_eq!(actual.state.as_u8(),1);
+        assert_eq!(actual.xid_errors,vec![154]);
+        assert_eq!(count_usable_gpus(&[actual.clone()]),1);
+        let output = PrometheusFormatter::format(&AllMetrics { hostname: "fixture-host".into(), gpus:vec![actual], ..Default::default() });
+        assert!(output.lines().any(|line|line.starts_with("DCXP_GPU_XID_CODE{") && line.contains("code=\"154\"") && line.ends_with(" 1")));
+    }
+
+    #[test]
+    fn health_definition_terminal_latch_survives_nominal_and_missing_history() {
+        let bdf="0000:61:00.0";
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let mut gpu=stale_nvml_gpu(bdf); gpu.nvml_essential_query_failed=false; gpu.state=GpuState::Ok;
+        let fault=reconcile_nvml_hardware_evidence(gpu.clone(),&pci_gpu(bdf),&terminal_dmesg(bdf),&mut tracker);
+        assert_eq!(fault.state.as_u8(),5);
+        let later=reconcile_nvml_hardware_evidence(gpu,&pci_gpu(bdf),&DmesgGpuErrors::default(),&mut tracker);
+        assert_eq!(later.state.as_u8(),5);
+        assert_eq!(count_usable_gpus(&[later.clone()]),0);
+        assert!(!should_collect_register_telemetry(&later,true));
+        assert_eq!(later.uuid,"GPU-KEEP-THIS-UUID");
+        assert!(later.power_usage.is_none());
+    }
+
+    #[test]
+    fn health_definition_eight_records_keep_failed_identity_and_seven_usable() {
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let cards:Vec<_>=(0..8).map(|index| {
+            let bdf=format!("0000:{:02x}:00.0",0x50+index);
+            let mut gpu=stale_nvml_gpu(&bdf); gpu.index=index; gpu.uuid=format!("GPU-SYNTHETIC-{index}");
+            gpu.nvml_essential_query_failed=index==3; gpu.state=GpuState::Ok;
+            reconcile_nvml_hardware_evidence(gpu,&pci_gpu(&bdf),&successful_empty_dmesg(),&mut tracker)
+        }).collect();
+        assert_eq!(count_usable_gpus(&cards),7);
+        assert_eq!(cards[3].uuid,"GPU-SYNTHETIC-3");
+        assert_eq!(cards[3].pci_bus_id,"0000:53:00.0");
+        assert_eq!(cards[3].state.as_u8(),2);
+        assert!(!should_collect_register_telemetry(&cards[3],true));
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:cards,..Default::default()});
+        assert_eq!(output.lines().filter(|line|line.starts_with("GPU_ERROR_STATE{")).count(),8);
+        assert!(!output.lines().any(|line|line.starts_with("DCGM_FI_DEV_POWER_USAGE{") && line.contains("GPU-SYNTHETIC-3")));
+    }
+
+// VER-HEALTH-001/003/005: actual adapter -> reconciliation -> formatter stateful test.
+    fn health_definition_recovery_gpu(code: Result<u32,nvml_wrapper::error::NvmlError>) -> GpuMetrics {
+        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+        match code {
+            Ok(n)=>{std::env::set_var("DCXP_FIXTURE_RECOVERY",n.to_string());std::env::remove_var("DCXP_FIXTURE_QUERY");}
+            Err(nvml_wrapper::error::NvmlError::NotSupported)=>{std::env::set_var("DCXP_FIXTURE_QUERY","recovery_action");std::env::set_var("DCXP_FIXTURE_ERROR","3");}
+            Err(nvml_wrapper::error::NvmlError::Unknown)=>{std::env::set_var("DCXP_FIXTURE_QUERY","recovery_action");std::env::set_var("DCXP_FIXTURE_ERROR","999");}
+            _=>panic!("fixture accepts only explicit cases"),
+        }
+        let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        super::super::gpu::collect_metrics_from_nvml(&context).gpus.remove(3)
+    }
+    #[test]
+    fn health_definition_future_snapshot_recovery_lifecycle_and_restart() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        use nvml_wrapper::error::NvmlError;
+        let pci=pci_gpu("0000:53:00.0");let empty=successful_empty_dmesg();
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&empty);
+        for (code,state) in [(Ok(0),1),(Ok(1),2),(Ok(0),1),(Ok(1),2),(Err(NvmlError::Unknown),0),(Ok(0),1),(Ok(1),2),(Err(NvmlError::NotSupported),2),(Ok(0),1)] {
+            let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(code),&pci,&empty,&mut tracker);
+            assert_eq!(actual.state.as_u8(),state);
+            assert_eq!(count_usable_gpus(&[actual.clone()]),if state==1 {1}else{0});
+            if state!=1 {assert!(!should_collect_register_telemetry(&actual,true));assert!(actual.power_usage.is_none());}
+            assert_eq!(actual.uuid,"GPU-SYNTHETIC-3");
+        }
+        let mut restarted=HardwareEvidenceTracker::from_boot_log(&empty);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Err(NvmlError::NotSupported)),&pci,&empty,&mut restarted).state.as_u8(),1);
+    }
+    #[test]
+    fn health_definition_future_terminal_latch_and_startup_history_are_separate_from_recovery() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");let terminal=terminal_dmesg(&pci.pci_bus_id);let empty=successful_empty_dmesg();
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&empty);
+        for history in [&terminal,&empty,&DmesgGpuErrors::default()] {
+            let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,history,&mut tracker);
+            assert_eq!(actual.state.as_u8(),5);assert_eq!(count_usable_gpus(&[actual]),0);
+        }
+        let mut restarted=HardwareEvidenceTracker::from_boot_log(&terminal);
+        let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&terminal,&mut restarted);
+        assert_eq!(actual.state.as_u8(),1);assert_eq!(actual.xid_errors,vec![79]);
+    }
+    #[test]
+    fn health_definition_future_pci_identity_resolution_refuses_ambiguity_and_ignores_index_order() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let first=pci_gpu("0000:53:00.0");let second=pci_gpu("0000:62:00.0");
+        assert_eq!(resolve_xid_pci_id("0000:53:00",&[second.clone(),first.clone()]),Some(first.pci_bus_id.clone()));
+        assert_eq!(resolve_xid_pci_id("0000:53:00",&[first.clone(),pci_gpu("0000:53:00.1")]),None);
+        assert_eq!(resolve_xid_pci_id("0000:53:00.0",&[second]),None);
+        assert_eq!(resolve_xid_pci_id("",&[first]),None);
+    }
+    #[test]
+    fn health_definition_future_source_read_status_distinguishes_unavailable_empty_and_truncated() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");
+        let mut many=successful_empty_dmesg();many.per_gpu.insert(pci.pci_bus_id.clone(),GpuDmesgInfo {xid_errors:(1000..1065).collect(),..Default::default()});
+        for (history,source,status) in [(DmesgGpuErrors::default(),"none","unavailable"),(successful_empty_dmesg(),"flagged_dmesg","valid"),(many,"flagged_dmesg","truncated")] {
+            let mut tracker=HardwareEvidenceTracker::from_boot_log(&history);
+            let gpu=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&history,&mut tracker);
+            let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:vec![gpu],..Default::default()});
+            assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_XID_SOURCE_STATUS{") && l.contains(&format!("source=\"{source}\"")) && l.contains(&format!("status=\"{status}\"")) && l.ends_with(" 1")));
+        }
+    }
+    #[test]
+    fn health_definition_future_functionless_startup_and_new_terminal_baselines_share_canonical_identity() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");
+        let mut parsed=DmesgGpuErrors {source:Some(DmesgSource::FlaggedDmesg),..Default::default()};
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, omitted",&mut parsed);
+        assert!(parsed.per_gpu.contains_key("0000:53:00"),"parser must retain functionless identity before inventory exists");
+        let mut startup=HardwareEvidenceTracker::from_boot_log(&parsed);
+        let mut historical=parsed.clone();
+        canonicalize_dmesg_inventory(&mut historical,&[pci.clone()],&mut startup);
+        let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&historical,&mut startup);
+        assert_eq!(actual.state.as_u8(),1,"canonicalization cannot invent a postbaseline terminal event");assert_eq!(actual.xid_errors,vec![79]);
+        let output=PrometheusFormatter::format(&AllMetrics {gpus:vec![actual],..Default::default()});
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_XID_CODE{") && l.contains("code=\"79\"") && l.ends_with(" 1")));
+        let mut fresh=HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let mut new_event=parsed.clone();canonicalize_dmesg_inventory(&mut new_event,&[pci.clone()],&mut fresh);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&new_event,&mut fresh).state.as_u8(),5);
+        let mut ambiguous=HardwareEvidenceTracker::from_boot_log(&parsed);
+        let mut unmatched=parsed;canonicalize_dmesg_inventory(&mut unmatched,&[pci.clone(),pci_gpu("0000:53:00.1")],&mut ambiguous);
+        let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&unmatched,&mut ambiguous);
+        assert_eq!(actual.state.as_u8(),1);assert!(actual.xid_errors.is_empty());
+        // Resolving an earlier ambiguity cannot turn startup history into a new event.
+        let mut resolved_later=DmesgGpuErrors {source:Some(DmesgSource::FlaggedDmesg),..Default::default()};
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, omitted",&mut resolved_later);
+        canonicalize_dmesg_inventory(&mut resolved_later,&[pci.clone()],&mut ambiguous);
+        let later=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&resolved_later,&mut ambiguous);
+        assert_eq!(later.state.as_u8(),1,"newly resolvable startup evidence is still historical");
+    }
+    #[test]
+    fn health_definition_future_unresolved_recovery_cache_uses_verified_identity_not_index() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        use nvml_wrapper::error::NvmlError;
+        let pci=pci_gpu("0000:53:00.0");let empty=successful_empty_dmesg();
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&empty);
+        let reset=health_definition_recovery_gpu(Ok(1));
+        assert_eq!(reconcile_nvml_hardware_evidence(reset.clone(),&pci,&empty,&mut tracker).state.as_u8(),2);
+        let mut reordered=health_definition_recovery_gpu(Err(NvmlError::NotSupported));reordered.index=7;
+        assert_eq!(reconcile_nvml_hardware_evidence(reordered,&pci,&empty,&mut tracker).state.as_u8(),2,"same verified UUID/BDF retains unresolved fault after enumeration changes");
+        let mut replacement=health_definition_recovery_gpu(Err(NvmlError::NotSupported));replacement.uuid="GPU-SYNTHETIC-REPLACEMENT".into();
+        assert_eq!(reconcile_nvml_hardware_evidence(replacement,&pci,&empty,&mut tracker).state.as_u8(),1,"new verified card at same BDF cannot inherit another UUID's recovery cache");
+        let mut missing=health_definition_recovery_gpu(Err(NvmlError::NotSupported));missing.uuid.clear();missing.pci_bus_id.clear();missing.index=reset.index;
+        let actual=reconcile_nvml_hardware_evidence(missing,&pci,&empty,&mut tracker);
+        assert_eq!(actual.state.as_u8(),0,"missing identity cannot borrow another card's fault or nominal clearance by index");
+        let unchanged=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Err(NvmlError::NotSupported)),&pci,&empty,&mut tracker);
+        assert_eq!(unchanged.state.as_u8(),2,"unidentified sample cannot clear the original unresolved card");
+    }
+    #[test]
+    fn health_definition_future_device_handle_failures_are_unmatched_diagnostics_not_index_joined() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        for (native,error) in [(15,"gpu_lost"),(16,"reset_required"),(999,"unknown")] {
+            for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+            std::env::set_var("DCXP_FIXTURE_RECOVERY","0");std::env::set_var("DCXP_FIXTURE_QUERY","device_by_index");std::env::set_var("DCXP_FIXTURE_ERROR",native.to_string());
+            let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+            let snapshot=super::super::gpu::collect_metrics_from_nvml(&context);
+            assert_eq!(snapshot.gpus.len(),7);assert_eq!(snapshot.unmatched_errors.len(),1);
+            assert!(snapshot.gpus.iter().all(|gpu|gpu.uuid!="GPU-SYNTHETIC-3"));
+            let collector=MetricsCollectorSync::new(Duration::from_millis(1),false,Arc::new(Mutex::new(HardwareEvidenceTracker::default())));
+            // Independently supplied PCI fallback is constructed by the actual fallback adapter.
+            let fallback=collector.create_error_gpu(99,&pci_gpu("0000:53:00.0"),"615.71.09");
+            assert_eq!(fallback.state.as_u8(),2);assert!(!should_collect_register_telemetry(&fallback,true));
+            let mut gpus=snapshot.gpus;gpus.push(fallback);
+            let metrics=AllMetrics {hostname:"fixture-host".into(),total_pci_gpus:8,nvml_gpus:7,gpus,nvml_unmatched_errors:snapshot.unmatched_errors,..Default::default()};
+            let output=PrometheusFormatter::format(&metrics);
+            assert_eq!(output.lines().filter(|line|line.starts_with("GPU_ERROR_STATE{")).count(),8);
+            assert!(!output.lines().any(|line|line.starts_with("GPU_ERROR_STATE{") && line.contains("UUID=\"\"")));
+            assert!(output.contains("DCXP_GPU_COUNT{type=\"nvml\",Hostname=\"fixture-host\"} 7"));
+            assert!(output.contains("DCXP_GPU_COUNT{type=\"usable\",Hostname=\"fixture-host\"} 7"));
+            let diagnostic:Vec<_>=output.lines().filter(|line|line.starts_with("DCXP_GPU_NVML_ERROR{") && line.contains("query=\"device_by_index\"")).collect();
+            assert_eq!(diagnostic.len(),1);assert!(diagnostic[0].contains("gpu=\"3\""));assert!(diagnostic[0].contains("UUID=\"\""));assert!(diagnostic[0].contains("pci_bus_id=\"\""));
+            assert!(diagnostic[0].contains(&format!("error=\"{error}\"")));assert!(diagnostic[0].contains(&format!("code=\"{native}\"")));
+        }
+    }
+
+    #[test]
+    fn health_definition_partial_identity_joins_unique_proc_uuid_or_exports_diagnostics_only() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        std::env::set_var("DCXP_FIXTURE_RECOVERY","1");std::env::set_var("DCXP_FIXTURE_QUERY","pci_info");std::env::set_var("DCXP_FIXTURE_ERROR","15");
+        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED","DCXP_FIXTURE_MODEL"] {std::env::remove_var(key);}
+        let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let native=super::super::gpu::collect_metrics_from_nvml(&context);
+        assert_eq!(native.gpus.len(),8);assert!(native.gpus[3].pci_bus_id.is_empty());
+        let mut inventory:Vec<_>=(0..8).map(|i|pci_gpu(&format!("0000:{:02x}:00.0",0x50+i))).collect();
+        inventory[3].proc_health=Some(ProcGpuHealth {uuid:Some("GPU-SYNTHETIC-3".into()),is_healthy:true,model:None,video_bios:None,firmware:None,failure_reason:None});
+        let (joined,diagnostics)=reconcile_nvml_inventory(native.gpus.clone(),&inventory);
+        assert_eq!(joined.len(),8);assert!(diagnostics.is_empty());assert_eq!(joined["0000:53:00.0"].uuid,"GPU-SYNTHETIC-3");assert_eq!(joined["0000:53:00.0"].state.as_u8(),2);
+        inventory[3].proc_health=None;
+        let (joined,diagnostics)=reconcile_nvml_inventory(native.gpus,&inventory);
+        assert_eq!(joined.len(),7);assert!(!diagnostics.is_empty());
+        let collector=MetricsCollectorSync::new(Duration::from_millis(1),false,Arc::new(Mutex::new(HardwareEvidenceTracker::default())));
+        let mut gpus:Vec<_>=joined.into_values().collect();gpus.push(collector.create_error_gpu(99,&inventory[3],"615.71.09"));
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus,nvml_gpus:8,total_pci_gpus:8,nvml_unmatched_errors:diagnostics,..Default::default()});
+        assert_eq!(output.lines().filter(|l|l.starts_with("GPU_ERROR_STATE{")).count(),8);
+        assert!(!output.lines().any(|l|l.starts_with("GPU_ERROR_STATE{") && l.contains("GPU-SYNTHETIC-3")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_NVML_ERROR{") && l.contains("GPU-SYNTHETIC-3") && l.contains("code=\"15\"")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION{") && l.contains("GPU-SYNTHETIC-3") && l.contains("pci_bus_id=\"\"") && l.ends_with(" 1")),"unjoined verified identity retains current raw recovery diagnostics");
+        assert_eq!(output.lines().filter(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION_STATUS{") && l.contains("GPU-SYNTHETIC-3")).count(),1);
+        std::env::set_var("DCXP_FIXTURE_NESTED_ERROR","999");
+        let multiple=super::super::gpu::collect_metrics_from_nvml(&context);
+        let (_,diagnostics)=reconcile_nvml_inventory(multiple.gpus,&inventory);
+        assert!(diagnostics.iter().any(|error|error.error.query=="pci_info"));
+        assert!(diagnostics.iter().any(|error|error.error.query=="recovery_action"));
+        assert!(diagnostics.len()>=2);
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),nvml_unmatched_errors:diagnostics,..Default::default()});
+        assert_eq!(output.lines().filter(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION_STATUS{") && l.contains("GPU-SYNTHETIC-3")).count(),1,"one current recovery status even with multiple query errors");
+        assert!(!output.lines().any(|l|l.starts_with("GPU_ERROR_STATE{")));
+    }
+
+    #[test]
+    fn health_definition_inventory_rejects_conflicting_and_duplicate_verified_uuids() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        std::env::set_var("DCXP_FIXTURE_RECOVERY","0");
+        let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let records=super::super::gpu::collect_metrics_from_nvml(&context).gpus;
+        let mut inventory:Vec<_>=(0..8).map(|i|pci_gpu(&format!("0000:{:02x}:00.0",0x50+i))).collect();
+        inventory[3].proc_health=Some(ProcGpuHealth {uuid:Some("GPU-SYNTHETIC-3".into()),is_healthy:true,model:None,video_bios:None,firmware:None,failure_reason:None});
+        let mut stale=records.clone();stale[3].uuid="GPU-SYNTHETIC-STALE".into();
+        let (joined,diagnostics)=reconcile_nvml_inventory(stale,&inventory);
+        assert_eq!(joined.len(),7);assert!(!joined.contains_key("0000:53:00.0"));assert!(diagnostics.iter().any(|d|d.uuid=="GPU-SYNTHETIC-STALE" && d.pci_bus_id=="0000:53:00.0"));
+        let mut duplicate=records.clone();duplicate[4].uuid=duplicate[3].uuid.clone();
+        let (joined,diagnostics)=reconcile_nvml_inventory(duplicate,&inventory);
+        assert_eq!(joined.len(),6);assert!(!joined.contains_key("0000:53:00.0"));assert!(!joined.contains_key("0000:54:00.0"));assert!(!diagnostics.is_empty());
+        inventory[3].proc_health=None;
+        assert_eq!(reconcile_nvml_inventory(records,&inventory).0.len(),8,"unique full BDF remains valid when proc UUID coverage is absent");
+    }
+
+    #[test]
+    fn health_definition_unique_partial_uuid_carries_unresolved_recovery_without_ambiguous_borrowing() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        std::env::set_var("DCXP_FIXTURE_RECOVERY","1");std::env::set_var("DCXP_FIXTURE_QUERY","pci_info");std::env::set_var("DCXP_FIXTURE_ERROR","999");
+        let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let native=super::super::gpu::collect_metrics_from_nvml(&context);
+        let inventory:Vec<_>=(0..8).map(|i|pci_gpu(&format!("0000:{:02x}:00.0",0x50+i))).collect();
+        let (_,diagnostics)=reconcile_nvml_inventory(native.gpus.clone(),&inventory);
+        let history=successful_empty_dmesg();let mut tracker=HardwareEvidenceTracker::from_boot_log(&history);
+        observe_unmatched_current_health(&diagnostics,&mut tracker);
+        std::env::set_var("DCXP_FIXTURE_QUERY","recovery_action");std::env::set_var("DCXP_FIXTURE_ERROR","3");
+        let later=super::super::gpu::collect_metrics_from_nvml(&context);
+        let (mut joined,_)=reconcile_nvml_inventory(later.gpus.clone(),&inventory);
+        let actual=reconcile_nvml_hardware_evidence(joined.remove("0000:53:00.0").unwrap(),&inventory[3],&history,&mut tracker);
+        assert_eq!(actual.state.as_u8(),2,"same verified UUID gaining BDF cannot turn unsupported coverage into fault clearance");
+        std::env::set_var("DCXP_FIXTURE_QUERY","");std::env::set_var("DCXP_FIXTURE_RECOVERY","0");
+        let valid=super::super::gpu::collect_metrics_from_nvml(&context);
+        let (mut joined,_)=reconcile_nvml_inventory(valid.gpus,&inventory);
+        assert_eq!(reconcile_nvml_hardware_evidence(joined.remove("0000:53:00.0").unwrap(),&inventory[3],&history,&mut tracker).state.as_u8(),1);
+        let mut ambiguous=native.gpus;ambiguous[4].uuid=ambiguous[3].uuid.clone();ambiguous[4].pci_bus_id.clear();
+        let (_,diagnostics)=reconcile_nvml_inventory(ambiguous,&inventory);
+        let mut fresh=HardwareEvidenceTracker::from_boot_log(&history);observe_unmatched_current_health(&diagnostics,&mut fresh);
+        let (mut joined,_)=reconcile_nvml_inventory(later.gpus,&inventory);
+        assert_eq!(reconcile_nvml_hardware_evidence(joined.remove("0000:53:00.0").unwrap(),&inventory[3],&history,&mut fresh).state.as_u8(),1,"duplicated UUID cannot lend another record's unresolved Reset");
+    }
+
+    #[test]
+    fn health_definition_review_unchanged_startup_history_survives_unique_ambiguous_unique() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");
+        let mut raw=successful_empty_dmesg();
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, omitted",&mut raw);
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&raw);
+        for inventory in [vec![pci.clone()],vec![pci.clone(),pci_gpu("0000:53:00.1")],vec![pci.clone()]] {
+            let mut snapshot=raw.clone();canonicalize_dmesg_inventory(&mut snapshot,&inventory,&mut tracker);
+            let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&snapshot,&mut tracker);
+            assert_eq!(actual.state.as_u8(),1,"unchanged startup history cannot become a new event after inventory ambiguity");
+        }
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, new occurrence",&mut raw);
+        canonicalize_dmesg_inventory(&mut raw,&[pci.clone()],&mut tracker);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&raw,&mut tracker).state.as_u8(),5,"a genuine new occurrence must still latch");
+    }
+    #[test]
+    fn health_definition_review_fallback_rows_retain_nonterminal_xid_snapshot() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let inventory:Vec<_>=(0..8).map(|i|pci_gpu(&format!("0000:{:02x}:00.0",0x50+i))).collect();
+        let collector=MetricsCollectorSync::new(Duration::from_millis(1),false,Arc::new(Mutex::new(HardwareEvidenceTracker::default())));
+        for query in ["device_by_index","pci_info"] {
+            std::env::set_var("DCXP_FIXTURE_QUERY",query);std::env::set_var("DCXP_FIXTURE_ERROR","15");
+            let context=super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+            let native=super::super::gpu::collect_metrics_from_nvml(&context);
+            let (mut joined,mut diagnostics)=reconcile_nvml_inventory(native.gpus,&inventory);diagnostics.extend(native.unmatched_errors);
+            assert!(!joined.contains_key("0000:53:00.0"));
+            let mut history=successful_empty_dmesg();super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 109, omitted\nNVRM: Xid (PCI:0000:53:00): 119, omitted\nNVRM: Xid (PCI:0000:53:00): 154, omitted",&mut history);
+            let mut tracker=HardwareEvidenceTracker::from_boot_log(&history);canonicalize_dmesg_inventory(&mut history,&inventory,&mut tracker);
+            let gpus:Vec<_>=inventory.iter().enumerate().map(|(i,pci)|{
+                let mut gpu=joined.remove(&pci.pci_bus_id).unwrap_or_else(||collector.create_error_gpu(i as u32,pci,"615.71.09"));
+                enrich_pci_gpu_snapshot(&mut gpu,pci,&history);gpu
+            }).collect();
+            assert_eq!(gpus[3].state.as_u8(),2);assert_eq!(gpus[3].xid_errors,vec![109,119,154],"{query} fallback loses observed numeric Xids");
+            let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus,total_pci_gpus:8,nvml_gpus:if query=="device_by_index" {7}else{8},nvml_unmatched_errors:diagnostics,..Default::default()});
+            assert_eq!(output.lines().filter(|l|l.starts_with("GPU_ERROR_STATE{")).count(),8);
+            for code in [109,119,154] {assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_XID_CODE{") && l.contains("pci_bus_id=\"0000:53:00.0\"") && l.contains(&format!("code=\"{code}\""))));}
+            assert!(!output.lines().any(|l|l.starts_with("DCGM_FI_DEV_POWER_USAGE{") && l.contains("gpu=\"3\"")));
+            let mut passthrough=collector.create_passthrough_gpu(3,&inventory[3],"615.71.09");
+            enrich_pci_gpu_snapshot(&mut passthrough,&inventory[3],&history);assert_eq!(passthrough.state.as_u8(),3);assert_eq!(passthrough.xid_errors,vec![109,119,154]);
+        }
+    }
+
+    #[test]
+    fn health_definition_review_ambiguous_nonterminal_token_cannot_hide_attributed_new_terminal_event() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let mut snapshot=successful_empty_dmesg();
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 154, omitted\nNVRM: Xid (PCI:0000:53:00.0): 79, new",&mut snapshot);
+        canonicalize_dmesg_inventory(&mut snapshot,&[pci.clone(),pci_gpu("0000:53:00.1")],&mut tracker);
+        let actual=reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&snapshot,&mut tracker);
+        assert_eq!(actual.state.as_u8(),5,"ambiguity cannot suppress an independently attributed full-BDF terminal event");
+    }
+
+    #[test]
+    fn health_definition_review_raw_terminal_provenance_survives_projection_ambiguity() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");let mut raw=successful_empty_dmesg();
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, historical",&mut raw);
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&raw);
+        let mut first=raw.clone();canonicalize_dmesg_inventory(&mut first,&[pci.clone()],&mut tracker);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&first,&mut tracker).state.as_u8(),1);
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00.0): 79, new independently attributed event",&mut raw);
+        canonicalize_dmesg_inventory(&mut raw,&[pci.clone(),pci_gpu("0000:53:00.1")],&mut tracker);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&raw,&mut tracker).state.as_u8(),5,"raw full-BDF event cannot be masked by an earlier projected functionless baseline count");
+    }
+
+    #[test]
+    fn health_definition_review_unchanged_mixed_raw_tokens_cannot_escalate_on_projection_changes() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let pci=pci_gpu("0000:53:00.0");let mut raw=successful_empty_dmesg();
+        super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, historical\nNVRM: Xid (PCI:0000:53:00.0): 79, historical",&mut raw);
+        let mut tracker=HardwareEvidenceTracker::from_boot_log(&raw);
+        for inventory in [vec![pci.clone()],vec![pci.clone(),pci_gpu("0000:53:00.1")],vec![pci.clone()]] {
+            let mut snapshot=raw.clone();canonicalize_dmesg_inventory(&mut snapshot,&inventory,&mut tracker);
+            assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&snapshot,&mut tracker).state.as_u8(),1,"unchanged raw source tokens cannot escalate through merged-count2->1->2 projection");
+        }
+        let mut fresh=HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let mut new_raw=successful_empty_dmesg();super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 79, new unresolved event",&mut new_raw);
+        let mut ambiguous=new_raw.clone();canonicalize_dmesg_inventory(&mut ambiguous,&[pci.clone(),pci_gpu("0000:53:00.1")],&mut fresh);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&ambiguous,&mut fresh).state.as_u8(),1);
+        canonicalize_dmesg_inventory(&mut new_raw,&[pci.clone()],&mut fresh);
+        assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&new_raw,&mut fresh).state.as_u8(),5,"unassigned new raw events must remain pending until identity resolves");
+    }
+
 }

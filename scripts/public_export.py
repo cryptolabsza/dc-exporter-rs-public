@@ -18,10 +18,11 @@ import tempfile
 PUBLIC_PATHS = frozenset("""
 .github/workflows/build.yml .gitignore Cargo.toml Cargo.lock LICENSE Makefile README.md
 RELEASING.md TESTING.md build.rs config.toml.example
-docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md
+docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md docs/gpu-health.md
 docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
 scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
 scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
+scripts/ci/rusd_abi.py scripts/ci/rusd-headers.json
 src/config.rs src/main.rs src/safe_nvml.rs src/state.rs
 src/metrics/collector.rs src/metrics/dmesg.rs src/metrics/gpu.rs src/metrics/mod.rs
 src/metrics/nvidia_rm/abi.rs src/metrics/nvidia_rm/mod.rs src/metrics/nvidia_rm/rusd.rs
@@ -31,14 +32,22 @@ src/tui/app.rs src/tui/mod.rs src/tui/ui.rs systemd/dc-exporter.service
 tests/nvidia_rm_abi.rs tests/nvidia_rm_rusd.rs tests/release_workflow.rs
 tests/thermal_policy.rs tests/thermal_worker.rs tests/test_public_export.py
 tests/test_ci_build.py tests/test_ci_publisher.py
+tests/test_ci_rusd_abi.py
+.github/workflows/ci-pool-build-recipe.yml scripts/ci/pool-build.sh scripts/ci/pool_manifest.py
+scripts/ci/notice_inventory.py tests/test_pool_workflow.py tests/test_ci_notices.py
+CONTRIBUTING.md SECURITY.md THIRD-PARTY-NOTICES.md
 """.split())
 
 REVIEWED_CHANGE_PATHS = frozenset({
+    ".github/workflows/ci-pool-build-recipe.yml", "scripts/ci/pool-build.sh", "scripts/ci/pool_manifest.py",
+    "scripts/ci/notice_inventory.py", "tests/test_pool_workflow.py", "tests/test_ci_notices.py",
+    "CONTRIBUTING.md", "SECURITY.md", "THIRD-PARTY-NOTICES.md", "systemd/dc-exporter.service",
     ".github/workflows/build.yml", ".gitignore", "Cargo.lock", "LICENSE", "README.md", "RELEASING.md", "TESTING.md",
-    "docs/gpu-thermal-abi.md", "docs/gpu-thermal-support.md", "docs/public-publishing.md",
+    "docs/gpu-thermal-abi.md", "docs/gpu-thermal-support.md", "docs/public-publishing.md", "docs/gpu-health.md",
     "docs/validation/rtx5090-acceptance.md", "docs/fixtures/rusd-abi-layout.c",
     "scripts/public_export.py", "scripts/ci/build_contract.py", "scripts/ci/build.sh",
     "scripts/ci/publish.py", "tests/release_workflow.rs", "tests/test_public_export.py",
+    "scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json", "tests/test_ci_rusd_abi.py",
     "tests/test_ci_build.py", "tests/test_ci_publisher.py", "Cargo.toml", "scripts/deploy.sh",
 })
 SCHEMA = "public-snapshot/1"
@@ -84,6 +93,7 @@ def tree(repo, commit):
     return entries
 
 
+# TRACEWEAVER: entrypoint=validate_path; req=REQ-PUB-007; trace=TRACE-PUB-007; ver=VER-PUB-007
 def validate_path(path):
     if (not isinstance(path, str) or path not in PUBLIC_PATHS or "\\" in path
             or path.startswith("/") or str(PurePosixPath(path)) != path

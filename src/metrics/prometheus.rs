@@ -67,6 +67,15 @@ impl PrometheusFormatter {
         // DCXP metric headers
         Self::write_metric_headers(&mut output);
 
+        // Unjoined diagnostics retain available identity without physical GPU rows.
+        let mut recovery_identities=std::collections::HashSet::new();
+        for unmatched in &metrics.nvml_unmatched_errors {
+            let labels=format!("gpu=\"{}\",UUID=\"{}\",pci_bus_id=\"{}\",device=\"nvidia{}\",modelName=\"{}\",Hostname=\"{}\",DCXP_FI_DRIVER_VERSION=\"{}\"",unmatched.index,unmatched.uuid,unmatched.pci_bus_id,unmatched.index,unmatched.name,metrics.hostname,unmatched.driver_version);
+            Self::format_query_error(&mut output,&labels,&unmatched.error);
+            if unmatched.recovery.is_some() && recovery_identities.insert((unmatched.index,unmatched.uuid.as_str(),unmatched.pci_bus_id.as_str())) {
+                Self::format_recovery_diagnostics(&mut output,unmatched.recovery.as_ref(),&labels);
+            }
+        }
         // Per-GPU metrics
         for gpu in &metrics.gpus {
             Self::format_gpu_metrics(&mut output, gpu, &metrics.hostname);
@@ -86,6 +95,14 @@ impl PrometheusFormatter {
     }
 
     fn write_metric_headers(output: &mut String) {
+        for (name,help) in [
+            ("DCXP_GPU_RECOVERY_ACTION","Current exact native recovery action code; action is a fixed interpretation, not a physical defect diagnosis."),
+            ("DCXP_GPU_RECOVERY_ACTION_STATUS","Current native recovery field coverage and validity."),
+            ("DCXP_GPU_NVML_ERROR","Current bounded typed query error; unmatched device_by_index gpu/device labels are enumeration context only, UUID/BDF empty."),
+            ("DCXP_GPU_XID_CODE","Occurrences by numeric Xid in current source snapshot, at most64 distinct codes per GPU."),
+            ("DCXP_GPU_XID_SOURCE_STATUS","Selected kernel-log read coverage; valid does not establish complete history."),
+            ("DCXP_GPU_XID_CODES_TRUNCATED","Whether more than64 distinct current Xid codes were observed for this GPU."),
+        ] {output.push_str(&format!("# HELP {} {}\n# TYPE {} gauge\n",name,help,name));}
         // DCXP unique metrics
         output.push_str("# HELP DCXP_FI_DEV_VRAM_TEMP VRAM temperature (in C). 0 if not supported or VM passthrough.\n");
         output.push_str("# TYPE DCXP_FI_DEV_VRAM_TEMP gauge\n");
@@ -178,6 +195,32 @@ impl PrometheusFormatter {
         output.push('\n');
     }
 
+    fn format_health_diagnostics(output:&mut String,gpu:&GpuMetrics,labels:&str) {
+        Self::format_recovery_diagnostics(output,gpu.recovery.as_ref(),labels);
+        for error in &gpu.nvml_errors {Self::format_query_error(output,labels,error);}
+        let mut codes=std::collections::BTreeMap::<u32,u32>::new();
+        for code in &gpu.xid_errors {let count=codes.entry(*code).or_default();*count=count.saturating_add(1);}
+        let truncated=codes.len()>64;
+        for (code,count) in codes.into_iter().take(64) {output.push_str(&format!("DCXP_GPU_XID_CODE{{{},code=\"{}\"}} {}\n",labels,code,count));}
+        let source=match gpu.xid_source {Some(super::dmesg::DmesgSource::FlaggedDmesg)=>"flagged_dmesg",Some(super::dmesg::DmesgSource::PlainDmesg)=>"plain_dmesg",Some(super::dmesg::DmesgSource::KernLog)=>"kern_log",None=>"none"};
+        let status=if !gpu.xid_source_read_succeeded {"unavailable"}else if truncated {"truncated"}else{"valid"};
+        output.push_str(&format!("DCXP_GPU_XID_SOURCE_STATUS{{{},source=\"{}\",status=\"{}\"}} 1\n",labels,source,status));
+        output.push_str(&format!("DCXP_GPU_XID_CODES_TRUNCATED{{{}}} {}\n",labels,u8::from(truncated)));
+    }
+    fn format_recovery_diagnostics(output:&mut String,recovery:Option<&super::gpu::RecoveryObservation>,labels:&str) {
+        if let Some(recovery)=recovery {
+            output.push_str(&format!("DCXP_GPU_RECOVERY_ACTION_STATUS{{{},status=\"{}\"}} 1\n",labels,recovery.status.as_str()));
+            if let Some(action)=recovery.action {
+                let interpretation=match action {0=>"none",1=>"gpu_reset",2=>"node_reboot",3=>"drain_p2p",4=>"drain_and_reset",5=>"recover_imex_domain",6=>"bus_reset",7=>"system_reboot",_=>"unknown"};
+                output.push_str(&format!("DCXP_GPU_RECOVERY_ACTION{{{},action=\"{}\"}} {}\n",labels,interpretation,action));
+            }
+        }
+    }
+    fn format_query_error(output:&mut String,labels:&str,error:&super::gpu::NvmlQueryError) {
+        let code=error.code.map(|code|code.to_string()).unwrap_or_else(||"unknown".into());
+        output.push_str(&format!("DCXP_GPU_NVML_ERROR{{{},query=\"{}\",error=\"{}\",code=\"{}\"}} 1\n",labels,error.query,error.error,code));
+    }
+
     fn format_gpu_metrics(output: &mut String, gpu: &GpuMetrics, hostname: &str) {
         // Common labels
         let dcxp_labels = format!(
@@ -210,6 +253,8 @@ impl PrometheusFormatter {
         let operational_metrics_valid = matches!(effective_state, GpuState::Ok | GpuState::Warning)
             && !gpu.nvml_essential_query_failed;
 
+        // Diagnostic evidence is retained even when operational telemetry is invalid.
+        Self::format_health_diagnostics(output,gpu,&dcxp_labels);
         // DCXP unique metrics
         if operational_metrics_valid {
             output.push_str(&format!(
@@ -768,4 +813,50 @@ mod tests {
             }
         }
     }
+
+    // VER-HEALTH-005: exact new snapshot contract against production formatter.
+    #[test]
+    fn health_definition_numeric_xid_gauges_survive_fault_telemetry_suppression() {
+        let metrics=AllMetrics {hostname:"fixture-host".into(),gpus:vec![GpuMetrics {
+            uuid:"GPU-SYNTHETIC".into(),pci_bus_id:"0000:61:00.0".into(),
+            state:GpuState::Error,xid_errors:vec![109,119,154,154],..Default::default()
+        }],..Default::default()};
+        let first=PrometheusFormatter::format(&metrics);
+        let second=PrometheusFormatter::format(&metrics);
+        assert_eq!(first,second);
+        assert!(first.contains("# TYPE DCXP_GPU_XID_CODE gauge\n"));
+        for (code,count) in [(109,1),(119,1),(154,2)] {
+            let samples:Vec<_>=first.lines().filter(|line|line.starts_with("DCXP_GPU_XID_CODE{") && line.contains(&format!("code=\"{code}\""))).collect();
+            assert_eq!(samples.len(),1,"{code}");
+            assert!(samples[0].ends_with(&format!(" {count}")));
+            assert!(samples[0].contains("UUID=\"GPU-SYNTHETIC\""));
+        }
+        assert!(!has_sample(&first,"DCGM_FI_DEV_POWER_USAGE","GPU-SYNTHETIC"));
+    }
+
+    #[test]
+    fn health_definition_xid_cardinality_is_64_with_explicit_truncation() {
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:vec![GpuMetrics {
+            uuid:"GPU-SYNTHETIC".into(),xid_errors:(1..=65).collect(),..Default::default()
+        }],..Default::default()});
+        assert_eq!(output.lines().filter(|line|line.starts_with("DCXP_GPU_XID_CODE{")).count(),64);
+        assert!(output.lines().any(|line|line.starts_with("DCXP_GPU_XID_CODES_TRUNCATED{") && line.ends_with(" 1")));
+    }
+
+// VER-HEALTH-005: exact additive action/status/error samples from actual adapter.
+    #[test]
+    fn health_definition_future_formatter_retains_diagnostics_without_operational_values() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+        std::env::set_var("DCXP_FIXTURE_RECOVERY","1");std::env::set_var("DCXP_FIXTURE_QUERY","power_usage");std::env::set_var("DCXP_FIXTURE_ERROR","15");
+        let context=crate::metrics::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let gpu=crate::metrics::gpu::collect_metrics_from_nvml(&context).gpus.remove(3);
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:vec![gpu],..Default::default()});
+        for metric in ["DCXP_GPU_RECOVERY_ACTION","DCXP_GPU_RECOVERY_ACTION_STATUS","DCXP_GPU_NVML_ERROR"] {assert!(output.contains(&format!("# TYPE {metric} gauge\n")));}
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION{") && l.contains("action=\"gpu_reset\"") && l.ends_with(" 1")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION_STATUS{") && l.contains("status=\"valid\"") && l.ends_with(" 1")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_NVML_ERROR{") && l.contains("query=\"power_usage\"") && l.contains("error=\"gpu_lost\"") && l.contains("code=\"15\"") && l.ends_with(" 1")));
+        assert!(!has_sample(&output,"DCGM_FI_DEV_POWER_USAGE","GPU-SYNTHETIC-3"));
+    }
+
 }

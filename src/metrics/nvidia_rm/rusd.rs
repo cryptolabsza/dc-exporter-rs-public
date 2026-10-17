@@ -5,8 +5,28 @@ use std::{collections::HashSet, time::Duration};
 pub fn profile_supported(request: &RmRequest, os: &str, arch: &str) -> bool {
     os == "linux"
         && arch == "x86_64"
-        && request.driver_version == DRIVER_VERSION
+        && profile_for_driver(&request.driver_version).is_some()
         && request.device_id == 0x2b85
+}
+
+/// The independently read NVRM line must identify the request's exact reviewed ABI.
+pub fn running_driver_matches(request_version: &str, proc_version_text: &str) -> bool {
+    if profile_for_driver(request_version).is_none() {
+        return false;
+    }
+    let mut lines = proc_version_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("NVRM version:"));
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() || !line.contains("Kernel Module") {
+        return false;
+    }
+    let mut versions = line.split_whitespace().filter(|word| {
+        word.as_bytes().first().is_some_and(u8::is_ascii_digit) && word.contains('.')
+    });
+    versions.next() == Some(request_version) && versions.next().is_none()
 }
 
 pub fn normalize_bdf(input: &str) -> Option<String> {
@@ -125,7 +145,14 @@ pub fn stable_snapshot(mut read: impl FnMut() -> (u64, i32, u64)) -> Result<Snap
 
 /// Fixture decoder. Actual mapped reads use volatile aligned loads and CPU/compiler fences.
 pub fn snapshot_bytes(bytes: &[u8]) -> Result<Snapshot, RmStatus> {
-    if bytes.len() < RUSD_SIZE {
+    snapshot_bytes_for_profile(
+        bytes,
+        profile_for_driver(DRIVER_VERSION).ok_or(RmStatus::Invalid)?,
+    )
+}
+
+pub fn snapshot_bytes_for_profile(bytes: &[u8], profile: AbiProfile) -> Result<Snapshot, RmStatus> {
+    if !profile.is_valid() || bytes.len() < profile.shared_size {
         return Err(RmStatus::Invalid);
     }
     let marker = u64::from_le_bytes(
@@ -351,6 +378,7 @@ pub(super) mod native {
 
     struct NativeTransport {
         request: RmRequest,
+        profile: AbiProfile,
         bdf: String,
         minor: u32,
         gpu_id: u32,
@@ -369,6 +397,11 @@ pub(super) mod native {
     }
     impl NativeTransport {
         fn new(request: &RmRequest) -> Result<Self, RmStatus> {
+            if !profile_supported(request, "linux", "x86_64") {
+                return Err(RmStatus::Unsupported);
+            }
+            let profile =
+                profile_for_driver(&request.driver_version).ok_or(RmStatus::Unsupported)?;
             let bdf = normalize_bdf(&request.pci_bus_id).ok_or(RmStatus::Invalid)?;
             if !bound(&bdf) {
                 return Err(RmStatus::DeviceLost);
@@ -380,10 +413,7 @@ pub(super) mod native {
                 return Err(RmStatus::DeviceLost);
             }
             let version = fs::read_to_string("/proc/driver/nvidia/version").map_err(io_status)?;
-            if !version
-                .split_whitespace()
-                .any(|word| word == DRIVER_VERSION)
-            {
+            if !running_driver_matches(profile.driver_version, &version) {
                 return Err(RmStatus::Unsupported);
             }
             let info = fs::read_to_string(format!("/proc/driver/nvidia/gpus/{bdf}/information"))
@@ -407,10 +437,11 @@ pub(super) mod native {
             let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
             let mapped_length = usize::try_from(page_size)
                 .ok()
-                .and_then(mapping_length)
+                .and_then(|size| profile.mapping_length(size))
                 .ok_or(RmStatus::Invalid)?;
             Ok(Self {
                 request: request.clone(),
+                profile,
                 bdf,
                 minor,
                 gpu_id: 0,
@@ -531,7 +562,10 @@ pub(super) mod native {
                 return Err(RmStatus::DeviceLost);
             }
             let base = self.mapped.ok_or(RmStatus::Invalid)?;
-            if self.mapped_length < RUSD_SIZE || base.as_ptr() as usize % 8 != 0 {
+            if !self.profile.is_valid()
+                || self.mapped_length < self.profile.shared_size
+                || base.as_ptr() as usize % 8 != 0
+            {
                 return Err(RmStatus::Invalid);
             }
             stable_snapshot(|| {
@@ -626,7 +660,7 @@ pub(super) mod native {
                             client: self.client,
                             device: self.device_handle,
                             memory: self.shared_handle,
-                            length: RUSD_SIZE as u64,
+                            length: self.profile.shared_size as u64,
                             flags: 1,
                             ..Default::default()
                         },

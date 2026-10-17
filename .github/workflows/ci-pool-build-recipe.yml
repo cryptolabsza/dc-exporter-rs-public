@@ -1,0 +1,53 @@
+# TRACEWEAVER: file-role=trusted-public-pool-recipe; req=REQ-PUB-004; trace=TRACE-PUB-004; ver=VER-PUB-004
+name: Trusted Rust CPU build recipe
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  build:
+    if: >-
+      github.repository == 'cryptolabsza/dc-exporter-rs-public' &&
+      github.repository_id == '1416116330' &&
+      github.event.repository.id == 1416116330 &&
+      github.event.repository.full_name == 'cryptolabsza/dc-exporter-rs-public' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref_protected &&
+      (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') &&
+      (toJSON(github.event.repository.private) == 'true' || toJSON(github.event.repository.private) == 'false') &&
+      (github.event.repository.visibility == '' ||
+       (toJSON(github.event.repository.private) == 'true' && github.event.repository.visibility == 'private') ||
+       (toJSON(github.event.repository.private) == 'false' && github.event.repository.visibility == 'public'))
+    runs-on:
+      group: ${{ toJSON(github.event.repository.private) == 'true' && 'ci-build-ephemeral' || 'ci-build-public-ephemeral' }}
+      labels: ci-linux-cpu-v1-r1416116330
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Locked tests, ABI, build and packaging
+        shell: bash
+        run: bash scripts/ci/pool-build.sh
+        env:
+          CARGO_TERM_COLOR: never
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+      - name: Upload exact run artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dc-exporter-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Upload locked licence verification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dc-exporter-notice-evidence-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: build-evidence/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
