@@ -387,6 +387,17 @@ fn read_proc_gpu_health(pci_bus_id: &str) -> Option<ProcGpuHealth> {
 mod tests {
     use super::*;
 
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_only_explicit_passthrough_bindings_prove_reservation() {
+        for binding in ["vfio-pci", "pci-stub"] {
+            assert!(is_passthrough_driver(binding), "{binding}");
+        }
+        for binding in ["nvidia", "nouveau", "", "vfio-pci-fake", "pci_stub", "qemu"] {
+            assert!(!is_passthrough_driver(binding), "{binding}");
+        }
+    }
+
     #[test]
     fn test_parse_pci_bus_id() {
         let result = parse_pci_bus_id("0000:01:00.0");

@@ -1043,6 +1043,94 @@ mod tests {
         .to_string()
     }
 
+    // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
+    #[test]
+    fn vm_definition_nominal_nvml_record_cannot_authorize_non_owned_host_registers() {
+        let mut gpu = stale_nvml_gpu("0000:23:00.0");
+        gpu.state = GpuState::Ok;
+        gpu.nvml_essential_query_failed = false;
+        for driver in [None, Some("vfio-pci"), Some("pci-stub"), Some("nouveau")] {
+            gpu.bound_driver = driver.map(str::to_string);
+            assert!(!should_collect_register_telemetry(&gpu, true), "{driver:?}");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-004; req=VM-FIX-004; trace=TRACE-VM-004
+    #[test]
+    fn vm_definition_current_proc_failure_survives_reconcile_count_and_formatter() {
+        let bdf = "0000:23:00.0";
+        let mut pci = pci_gpu(bdf);
+        pci.proc_health = Some(ProcGpuHealth {
+            model: Some("NVIDIA GeForce RTX 5090".into()),
+            uuid: Some("GPU-KEEP-THIS-UUID".into()),
+            video_bios: None,
+            firmware: None,
+            is_healthy: false,
+            failure_reason: Some("current fixture failure".into()),
+        });
+        let mut tracker = HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg());
+        let mut nvml = stale_nvml_gpu(bdf);
+        nvml.state = GpuState::Ok;
+        nvml.nvml_essential_query_failed = false;
+        let gpu = reconcile_nvml_hardware_evidence(nvml, &pci, &successful_empty_dmesg(), &mut tracker);
+        assert_eq!(gpu.state, GpuState::HardwareFailure);
+        assert_eq!(count_usable_gpus(std::slice::from_ref(&gpu)), 0);
+        let output = PrometheusFormatter::format(&AllMetrics {
+            hostname: "vm-fixture".into(),
+            total_pci_gpus: 1,
+            gpus: vec![gpu],
+            ..Default::default()
+        });
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{") && l.ends_with(" 5")));
+        assert!(output.contains("DCXP_GPU_COUNT{type=\"usable\",Hostname=\"vm-fixture\"} 0"));
+        assert!(output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP_VALID{") && l.ends_with(" 0")));
+        assert!(!output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP{")));
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-004; req=VM-FIX-004; trace=TRACE-VM-004
+    #[test]
+    fn vm_definition_historical_xid_does_not_fabricate_active_failure_in_formatter() {
+        let bdf = "0000:23:00.0";
+        let history = terminal_dmesg(bdf);
+        let mut tracker = HardwareEvidenceTracker::from_boot_log(&history);
+        let mut nvml = stale_nvml_gpu(bdf);
+        nvml.state = GpuState::Ok;
+        nvml.nvml_essential_query_failed = false;
+        let gpu = reconcile_nvml_hardware_evidence(nvml, &pci_gpu(bdf), &history, &mut tracker);
+        assert_eq!(gpu.state, GpuState::Ok);
+        assert_eq!(count_usable_gpus(std::slice::from_ref(&gpu)), 1);
+        let output = PrometheusFormatter::format(&AllMetrics {
+            hostname: "vm-fixture".into(),
+            total_pci_gpus: 1,
+            gpus: vec![gpu],
+            ..Default::default()
+        });
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{") && l.ends_with(" 1")));
+        assert!(output.contains("DCXP_GPU_COUNT{type=\"usable\",Hostname=\"vm-fixture\"} 1"));
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_HW_FAILURE{") && l.ends_with(" 0")));
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-006; req=VM-FIX-006; trace=TRACE-VM-006
+    #[test]
+    fn vm_definition_supplied_guest_temperatures_keep_existing_metrics_and_usable_count() {
+        let mut gpu = stale_nvml_gpu("0000:c1:00.0");
+        gpu.source = MetricSource::Vm;
+        gpu.state = GpuState::Ok;
+        gpu.nvml_essential_query_failed = false;
+        gpu.vram_temp = Some(72);
+        gpu.hotspot_temp = Some(81);
+        assert_eq!(count_usable_gpus(std::slice::from_ref(&gpu)), 1);
+        let output = PrometheusFormatter::format(&AllMetrics {
+            hostname: "vm-fixture".into(), total_pci_gpus: 1, gpus: vec![gpu], ..Default::default()
+        });
+        assert!(output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP{")
+            && l.contains("source=\"vm\"") && l.ends_with(" 72")));
+        assert!(output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP_VALID{")
+            && l.contains("source=\"vm\"") && l.ends_with(" 1")));
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{") && l.ends_with(" 1")));
+        assert!(output.contains("DCXP_GPU_COUNT{type=\"usable\",Hostname=\"vm-fixture\"} 1"));
+    }
+
     #[test]
     fn test_hostname() {
         let hostname = get_hostname();

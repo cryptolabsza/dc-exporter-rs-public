@@ -493,6 +493,57 @@ fn parse_metric(s: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_libvirt_guest_target_is_not_host_assignment_evidence() {
+        let xml = r#"<domain><devices>
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0000' bus='0xc1' slot='0x00' function='0x0'/>
+  </source>
+  <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+</hostdev>
+</devices></domain>"#;
+        assert_eq!(parse_gpu_passthrough_xml(xml), vec!["0000:c1:00.0"]);
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_libvirt_source_parsing_accepts_xml_layout_and_quote_variants() {
+        for xml in [
+            r#"<domain><devices><hostdev type="pci"><source><address function="0x0" slot="0x00" bus="0xc1" domain="0x0000"/></source></hostdev></devices></domain>"#,
+            "<domain>\n<devices>\n<hostdev\n type='pci'>\n<source>\n<address\n domain='0x0000'\n bus='0xc1'\n slot='0x00'\n function='0x0'/>\n</source>\n</hostdev>\n</devices>\n</domain>",
+        ] {
+            assert_eq!(parse_gpu_passthrough_xml(xml), vec!["0000:c1:00.0"], "{xml}");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_libvirt_rejects_malformed_xml_and_invalid_source_bdf() {
+        for xml in [
+            "<hostdev type='pci'>\n<source>\n<address domain='0x0000' bus='0xc1' slot='0x00' function='0x0'/>",
+            "<domain><devices>\n<hostdev type='pci'>\n<source>\n<address domain='0x0000' bus='0xzz' slot='0x00' function='0x0'/>\n</source>\n</hostdev>\n</devices></domain>",
+            "<domain><devices>\n<hostdev type='pci'>\n<source>\n<address domain='0x0000' bus='0xc1' slot='0x20' function='0x0'/>\n</source>\n</hostdev>\n</devices></domain>",
+        ] {
+            assert!(parse_gpu_passthrough_xml(xml).is_empty(), "{xml}");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_libvirt_guest_only_address_proves_no_host_assignment() {
+        let xml = "<domain><devices>\n<hostdev type='pci'>\n<address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>\n</hostdev>\n</devices></domain>";
+        assert!(parse_gpu_passthrough_xml(xml).is_empty());
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_libvirt_valid_source_remains_detectable_without_guest_target() {
+        let xml = "<domain><devices>\n<hostdev type='pci'>\n<source>\n<address domain='0x0001' bus='0xc1' slot='0x00' function='0x0'/>\n</source>\n</hostdev>\n</devices></domain>";
+        assert_eq!(parse_gpu_passthrough_xml(xml), vec!["0001:c1:00.0"]);
+    }
+
     #[test]
     fn test_parse_pci_address() {
         let line = r#"<address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>"#;
