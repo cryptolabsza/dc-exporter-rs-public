@@ -7,10 +7,54 @@ import json
 from pathlib import Path
 import re
 import tomllib
+import urllib.request
 
 TARGET = 'x86_64-unknown-linux-gnu'
 METADATA_COMMAND = ['cargo', 'metadata', '--locked', '--format-version', '1',
                     '--filter-platform', TARGET]
+# Both published crates omit the workspace-root licences. Their original
+# manifests/source match upstream release v0.10.0 at this immutable commit.
+# Restrict this supplement to the reviewed Cargo.lock archive bytes; never
+# substitute a generic SPDX text or fetch arbitrary metadata-supplied URLs.
+UPSTREAM_RELEASE = 'https://raw.githubusercontent.com/rust-nvml/nvml-wrapper/940354559b6131b23734a97050c929483c9b4ad0/'
+UPSTREAM_CRATES = {
+    ('nvml-wrapper', '0.10.0'): '0c9bff0aa1d48904a1385ea2a8b97576fbdcbc9a3cfccd0d31fe978e1c4038c5',
+    ('nvml-wrapper-sys', '0.8.0'): '698d45156f28781a4e79652b6ebe2eaa0589057d588d3aec1333f6466f13fcb5',
+}
+UPSTREAM_FILES = [
+    ('LICENSE-MIT', '877160c91906b0f08812fb90ed34b77f2810f262ce66c745c0be3590e36f6953'),
+    ('LICENSE-APACHE', 'e70785c8a3c78593f88a142d254d17dcbf00ded0a7c67e17dc5d9d0fe4d49f7a'),
+]
+
+
+def upstream_licence_files(package, archive_checksum):
+    identity = (package['name'], package['version'])
+    if (identity not in UPSTREAM_CRATES or archive_checksum != UPSTREAM_CRATES[identity]
+            or package.get('source') != 'registry+https://github.com/rust-lang/crates.io-index'
+            or package.get('license') != 'MIT OR Apache-2.0'):
+        raise ValueError(f"Selected dependency is missing actual licence files: {package['name']} {package['version']}")
+    result = []
+    for name, expected in UPSTREAM_FILES:
+        url = UPSTREAM_RELEASE + name
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = response.read(1024 * 1024 + 1)
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise ValueError(f"Upstream licence checksum mismatch: {package['name']} {package['version']} {name}")
+        result.append({'path': 'upstream/' + name, 'sha256': expected,
+                       'text': licence_text(data), 'upstream_url': url})
+    return result
+
+
+def licence_text(data):
+    if not 0 < len(data) <= 1024 * 1024:
+        raise ValueError('Invalid dependency licence file size')
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('Dependency licence must be UTF-8') from error
+    if not text.strip() or '\x00' in text:
+        raise ValueError('Empty or invalid dependency licence text')
+    return text
 
 
 def selected_packages(metadata, lock):
@@ -58,7 +102,7 @@ def selected_packages(metadata, lock):
     return root, [selected[key] for key in sorted(selected)]
 
 
-def licence_files(package):
+def licence_files(package, archive_checksum=None):
     expression = package.get('license')
     explicit = package.get('license_file')
     if not expression and not explicit:
@@ -82,24 +126,20 @@ def licence_files(package):
         elif path.is_dir() and path.name.lower() in {'licenses', 'licences'}:
             selected.update(p for p in path.rglob('*') if p.is_file())
     if not selected:
-        raise ValueError('Selected dependency is missing actual licence files')
+        return upstream_licence_files(package, archive_checksum)
     result = []
     for path in sorted(selected, key=lambda p: str(p.relative_to(root))):
         if path.is_symlink() or not path.resolve().is_relative_to(root) or not 0 < path.stat().st_size <= 1024 * 1024:
             raise ValueError('Invalid dependency licence file')
         data = path.read_bytes()
-        try:
-            text = data.decode('utf-8')
-        except UnicodeDecodeError as error:
-            raise ValueError('Dependency licence must be UTF-8') from error
-        if not text.strip() or '\x00' in text:
-            raise ValueError('Empty or invalid dependency licence text')
+        text = licence_text(data)
         result.append({'path': str(path.relative_to(root)), 'sha256': hashlib.sha256(data).hexdigest(), 'text': text})
     return result
 
 
 def collect(metadata, lock, project_notice):
     root, selected = selected_packages(metadata, lock)
+    checksums = {(p['name'], p['version'], p.get('source')): p.get('checksum') for p in lock['package']}
     if not project_notice.strip() or any(token not in project_notice for token in ['Copyright (c) CryptoLabs ZA', 'NVIDIA CORPORATION', 'Copyright (c) 2026 Philip Langdale.']):
         raise ValueError('Project/adaptation notice is incomplete')
     records = []
@@ -108,14 +148,17 @@ def collect(metadata, lock, project_notice):
             continue
         records.append({'id': package['id'], 'name': package['name'], 'version': package['version'],
                         'source': package['source'], 'license': package.get('license'),
-                        'files': licence_files(package)})
+                        'files': licence_files(package, checksums[(package['name'], package['version'], package['source'])])})
     text = project_notice.rstrip() + '\n\n# Locked Linux dependency notices\n\n'
     text += 'Target: `' + TARGET + '`. Default features; normal and build dependencies; dev dependencies excluded.\n'
     for package in records:
         text += f"\n## Runtime dependency: {package['name']} {package['version']}\n\n"
         text += f"Source: `{package['source']}`\n\nDeclared licence: `{package['license'] or 'licence-file'}`\n"
         for item in package['files']:
-            text += '\n### ' + item['path'] + '\n\n' + item['text'].rstrip() + '\n'
+            text += '\n### ' + item['path'] + '\n\n'
+            if 'upstream_url' in item:
+                text += f"Upstream source: `{item['upstream_url']}`\n\nSHA-256: `{item['sha256']}`\n\n"
+            text += item['text'].rstrip() + '\n'
     # File-system locations from metadata must never enter a public notice asset.
     if any(package['manifest_path'] in text for package in selected):
         raise ValueError('Operator path leaked into licence text')

@@ -129,7 +129,7 @@ impl VmMetricsCollector {
         }
 
         let xml = String::from_utf8_lossy(&output.stdout);
-        parse_gpu_passthrough_xml(&xml)
+        parse_vm_gpu_mappings_xml(&xml).into_iter().map(|(host, _)| host).collect()
     }
 
     /// Execute command inside VM via QEMU guest agent
@@ -223,10 +223,17 @@ impl VmMetricsCollector {
 
     /// Get VRAM/Hotspot temps from inside VM via sysfs
     pub fn get_vm_gpu_temps(vm_name: &str) -> HashMap<String, (u32, u32)> {
+        Self::get_vm_gpu_temps_with(vm_name, &mut Self::guest_exec)
+    }
+
+    fn get_vm_gpu_temps_with(
+        vm_name: &str,
+        guest_exec: &mut impl FnMut(&str, &str, &[&str]) -> Option<(String, i32)>,
+    ) -> HashMap<String, (u32, u32)> {
         let mut temps = HashMap::new();
 
         // Try Python first
-        if let Some((stdout, 0)) = Self::guest_exec(
+        if let Some((stdout, 0)) = guest_exec(
             vm_name,
             "/usr/bin/python3",
             &["-c", VM_TEMP_READER_PYTHON],
@@ -248,7 +255,7 @@ impl VmMetricsCollector {
         }
 
         // Fallback to shell
-        if let Some((stdout, 0)) = Self::guest_exec(vm_name, "/bin/sh", &["-c", VM_TEMP_READER_SHELL])
+        if let Some((stdout, 0)) = guest_exec(vm_name, "/bin/sh", &["-c", VM_TEMP_READER_SHELL])
         {
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.split(':').collect();
@@ -267,6 +274,18 @@ impl VmMetricsCollector {
 
     /// Get GPU metrics from inside VM via nvidia-smi
     pub fn get_vm_gpu_metrics(vm_name: &str, host_gpu_indices: &[u32]) -> Vec<GpuMetrics> {
+        Self::get_vm_gpu_metrics_with(vm_name, host_gpu_indices, &HashMap::new(), true, &mut Self::guest_exec)
+    }
+
+    // The ordered legacy input is retained until semantic RED demonstrates the
+    // ordinal fallback. Mapping and policy are deliberately not applied yet.
+    fn get_vm_gpu_metrics_with(
+        vm_name: &str,
+        host_gpu_indices: &[u32],
+        _mappings: &HashMap<String, (String, u32, u16)>,
+        _enable_register_access: bool,
+        guest_exec: &mut impl FnMut(&str, &str, &[&str]) -> Option<(String, i32)>,
+    ) -> Vec<GpuMetrics> {
         let mut gpus = Vec::new();
 
         // Run nvidia-smi inside VM
@@ -275,7 +294,7 @@ impl VmMetricsCollector {
             "--format=csv,noheader,nounits"
         ];
 
-        let (stdout, exit_code) = match Self::guest_exec(vm_name, "/usr/bin/nvidia-smi", &nvidia_smi_args) {
+        let (stdout, exit_code) = match guest_exec(vm_name, "/usr/bin/nvidia-smi", &nvidia_smi_args) {
             Some(r) => r,
             None => {
                 debug!("Failed to run nvidia-smi in VM {}", vm_name);
@@ -289,7 +308,7 @@ impl VmMetricsCollector {
         }
 
         // Get VRAM/Hotspot temps via sysfs
-        let vm_temps = Self::get_vm_gpu_temps(vm_name);
+        let vm_temps = Self::get_vm_gpu_temps_with(vm_name, guest_exec);
 
         // Parse nvidia-smi output
         for line in stdout.lines() {
@@ -426,6 +445,12 @@ impl VmMetricsCollector {
 
         all_metrics
     }
+}
+
+// TRACEWEAVER: entrypoint=parse_vm_gpu_mappings_xml; req=VM-FIX-002,VM-FIX-003; trace=TRACE-VM-002,TRACE-VM-003
+fn parse_vm_gpu_mappings_xml(xml: &str) -> Vec<(String, String)> {
+    // Keep the original address decisions until the shared semantic RED run.
+    parse_gpu_passthrough_xml(xml).into_iter().map(|address| (address.clone(), address)).collect()
 }
 
 /// Parse GPU passthrough from VM XML
@@ -578,4 +603,119 @@ mod tests {
         assert!(!is_valid_vm_name("vm\nmalicious"));  // newline
         assert!(!is_valid_vm_name("vm\x00null"));  // null byte
     }
+
+    fn vm_definition_csv(index: u32, guest_bdf: &str, uuid: &str, temp: u32) -> String {
+        format!("{index}, NVIDIA fixture, {uuid}, {guest_bdf}, {temp}, 30, 100.0, 20, 10, 100, 1000, 1200, 2000, 590.48.01")
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_definition_reordered_guest_indexes_map_exact_bdf_without_ordinal_fallback() {
+        let mappings = HashMap::from([
+            ("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, 0x2204)),
+            ("0000:02:00.0".into(), ("0000:41:00.0".into(), 3, 0x2204)),
+        ]);
+        let csv = [vm_definition_csv(0, "00000000:02:00.0", "GPU-B", 62),
+            vm_definition_csv(1, "00000000:01:00.0", "GPU-A", 51),
+            vm_definition_csv(7, "00000000:03:00.0", "GPU-UNMAPPED", 99)].join("\n");
+        let mut calls = Vec::new();
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, false,
+            &mut |vm, command, args| {
+                calls.push((vm.to_string(), command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+                Some((csv.clone(), 0))
+            });
+        assert_eq!(rows.len(), 2);
+        for (uuid, index, host_bdf, temp) in [
+            ("GPU-A", 7, "0000:c1:00.0", 51), ("GPU-B", 3, "0000:41:00.0", 62),
+        ] {
+            let row = rows.iter().find(|r| r.uuid == uuid).unwrap();
+            assert_eq!(row.index, index);
+            assert_eq!(row.pci_bus_id, host_bdf);
+            assert_eq!(row.gpu_temp, Some(temp));
+            assert_eq!(row.source, MetricSource::Vm);
+        }
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "/usr/bin/nvidia-smi");
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_definition_duplicate_guest_rows_are_not_arbitrarily_selected() {
+        let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, 0x2204))]);
+        let csv = [vm_definition_csv(0, "0000:01:00.0", "GPU-A", 51),
+            vm_definition_csv(1, "00000000:01:00.0", "GPU-B", 99)].join("\n");
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, false,
+            &mut |_, _, _| Some((csv.clone(), 0)));
+        assert!(rows.is_empty(), "conflicting guest rows must retain assignment-only status");
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_definition_xml_mapping_rejects_duplicate_missing_and_conflicting_targets() {
+        let entry = |host: &str, guest: &str| format!(
+            "<hostdev type='pci'><source><address domain='0x0000' bus='0x{host}' slot='0x00' function='0x0'/></source><address type='pci' domain='0x0000' bus='0x{guest}' slot='0x00' function='0x0'/></hostdev>");
+        let wrap = |entries: String| format!("<domain><devices>{entries}</devices></domain>");
+        let valid = wrap(format!("{}{}", entry("c1", "02"), entry("41", "01")));
+        assert_eq!(parse_vm_gpu_mappings_xml(&valid), vec![
+            ("0000:c1:00.0".to_string(), "0000:02:00.0".to_string()),
+            ("0000:41:00.0".to_string(), "0000:01:00.0".to_string()),
+        ]);
+        for entries in [
+            format!("{}{}", entry("c1", "01"), entry("41", "01")),
+            format!("{}{}", entry("c1", "01"), entry("c1", "02")),
+            format!("{}{}", entry("c1", "01"), entry("c1", "01")),
+            "<hostdev type='pci'><source><address domain='0x0000' bus='0xc1' slot='0x00' function='0x0'/></source></hostdev>".into(),
+            entry("c1", "zz"),
+        ] {
+            assert!(parse_vm_gpu_mappings_xml(&wrap(entries)).is_empty());
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
+    #[test]
+    fn vm_definition_guest_command_reader_honors_no_register_and_unsupported_profiles() {
+        for (device_id, enabled) in [(0x2204, false), (0x2b85, true), (0x26b2, true), (0xffff, true)] {
+            let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, device_id))]);
+            let csv = vm_definition_csv(0, "00000000:01:00.0", "GPU-A", 51);
+            let mut calls = Vec::new();
+            let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, enabled,
+                &mut |vm, command, args| {
+                    calls.push((vm.to_string(), command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+                    if command == "/usr/bin/nvidia-smi" { Some((csv.clone(), 0)) }
+                    else { Some((r#"[{"p":"0000:01:00.0","v":73,"h":81}]"#.into(), 0)) }
+                });
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].gpu_temp, Some(51));
+            assert_eq!(rows[0].vram_temp, None);
+            assert_eq!(rows[0].hotspot_temp, None);
+            assert_eq!(calls.len(), 1, "device={device_id:x}, enabled={enabled}, calls={calls:?}");
+            assert_eq!(calls[0].1, "/usr/bin/nvidia-smi");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
+    #[test]
+    fn vm_definition_unvalidated_3090_guest_profile_never_invokes_bar_callback() {
+        let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, 0x2204))]);
+        let csv = vm_definition_csv(0, "00000000:01:00.0", "GPU-A", 51);
+        let mut calls = Vec::new();
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, true,
+            &mut |_, command, args| {
+                calls.push((command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+                if command == "/usr/bin/nvidia-smi" { Some((csv.clone(), 0)) }
+                else { Some((r#"[{"p":"0000:01:00.0","v":73,"h":81},{"p":"0000:11:00.0","v":99,"h":99}]"#.into(), 0)) }
+            });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].gpu_temp, Some(51));
+        assert_eq!(rows[0].vram_temp, None);
+        assert_eq!(rows[0].hotspot_temp, None);
+        assert_eq!(calls.len(), 1, "device ID alone cannot establish a validated guest BAR profile");
+        assert_eq!(calls[0].0, "/usr/bin/nvidia-smi");
+    }
+
+    // HELD future case, not an executable expectation: a separately hardware-qualified
+    // guest BAR profile may eventually have a BDF-scoped positive reader control.
+    // The currently validated guest-profile inventory is empty, including RTX3090.
+    // No injectable policy or device-ID-only enablement is authorized by this fixture.
+
 }

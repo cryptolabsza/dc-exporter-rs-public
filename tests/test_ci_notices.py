@@ -2,12 +2,15 @@
 # TRACEWEAVER: verifies=VER-PUB-007; req=REQ-PUB-007; trace=TRACE-PUB-007
 """Locked resolved closure and licence files; fixtures claim no actual crate licensing."""
 import copy
+import hashlib
 import importlib.util
 from pathlib import Path
 import re
 import tempfile
 import tomllib
 import unittest
+import urllib.request
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,6 +50,77 @@ class LockedNoticeTests(unittest.TestCase):
         notices = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(notices)
         return notices.generate(metadata or self.metadata, self.lock, (ROOT / 'THIRD-PARTY-NOTICES.md').read_text())
+
+    def omitted_nvml_fixture(self, name='nvml-wrapper'):
+        # These exact locked releases omit all licence files from their archives.
+        # Text below is synthetic; upstream provenance is pinned in the helper.
+        spec = importlib.util.spec_from_file_location('notice_inventory', ROOT / 'scripts/ci/notice_inventory.py')
+        notices = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notices)
+        locked = next(p for p in self.lock['package'] if p['name'] == name)
+        crate = self.crates['hyper']
+        (crate / 'LICENSE').unlink(missing_ok=True)
+        package = {'id': f"{locked['source']}#{name}@{locked['version']}",
+                   'name': name, 'version': locked['version'], 'source': locked['source'],
+                   'license': 'MIT OR Apache-2.0', 'license_file': None,
+                   'manifest_path': str(crate / 'Cargo.toml')}
+        return notices, locked, package
+
+    def test_exact_omitted_nvml_releases_preserve_both_pinned_upstream_texts(self):
+        for name in ['nvml-wrapper', 'nvml-wrapper-sys']:
+            with self.subTest(name=name):
+                notices, locked, package = self.omitted_nvml_fixture(name)
+                texts = [b'SYNTHETIC MIT fixture; no upstream licensing authority.\n',
+                         b'SYNTHETIC Apache fixture; no upstream licensing authority.\n']
+                pins = [(filename, hashlib.sha256(data).hexdigest())
+                        for filename, data in zip(['LICENSE-MIT', 'LICENSE-APACHE'], texts)]
+                metadata = copy.deepcopy(self.metadata)
+                metadata['packages'] = [metadata['packages'][0], package]
+                metadata['resolve']['nodes'] = [
+                    {'id': self.root_id, 'dependencies': [package['id']], 'deps': [{'pkg': package['id'], 'dep_kinds': [{'kind': None, 'target': None}]}]},
+                    {'id': package['id'], 'dependencies': [], 'deps': []}]
+                with mock.patch.object(notices, 'UPSTREAM_FILES', pins, create=True), mock.patch.object(urllib.request, 'urlopen') as fetch:
+                    fetch.return_value.__enter__.return_value.read.side_effect = texts
+                    text, records, _ = notices.collect(metadata, self.lock, (ROOT / 'THIRD-PARTY-NOTICES.md').read_text())
+                    self.assertEqual([r['name'] for r in records], [name])
+                    files = records[0]['files']
+                    for body in texts:
+                        self.assertIn(body.decode().strip(), text)
+                self.assertEqual([f['text'] for f in files], [t.decode() for t in texts])
+                self.assertEqual([f['sha256'] for f in files], [p[1] for p in pins])
+                for result, call, (filename, _) in zip(files, fetch.call_args_list, pins):
+                    url = 'https://raw.githubusercontent.com/rust-nvml/nvml-wrapper/940354559b6131b23734a97050c929483c9b4ad0/' + filename
+                    self.assertEqual(result['upstream_url'], url)
+                    self.assertEqual(result['path'], 'upstream/' + filename)
+                    self.assertEqual(call.args[0], url)
+                (self.crates['hyper'] / 'LICENSE').write_text(self.texts['hyper'])
+
+    def test_upstream_supplement_rejects_hash_mismatch(self):
+        notices, locked, package = self.omitted_nvml_fixture()
+        with mock.patch.object(urllib.request, 'urlopen') as fetch:
+            fetch.return_value.__enter__.return_value.read.return_value = b'incorrect upstream bytes'
+            with self.assertRaisesRegex(ValueError, 'checksum'):
+                notices.licence_files(package, locked['checksum'])
+
+    def test_upstream_supplement_is_exact_identity_expression_and_archive_only(self):
+        notices, locked, package = self.omitted_nvml_fixture()
+        for field, value in [('name', 'unknown-crate'), ('version', '0.10.1'),
+                             ('source', 'registry+https://invalid.example/index'),
+                             ('license', 'MIT')]:
+            changed = dict(package, **{field: value})
+            with self.subTest(field=field), mock.patch.object(urllib.request, 'urlopen') as fetch:
+                with self.assertRaises(ValueError):
+                    notices.licence_files(changed, locked['checksum'])
+                fetch.assert_not_called()
+        with mock.patch.object(urllib.request, 'urlopen') as fetch:
+            with self.assertRaises(ValueError):
+                notices.licence_files(package, '0' * 64)
+            fetch.assert_not_called()
+
+    def test_missing_licence_error_identifies_exact_package(self):
+        (self.crates['hyper'] / 'LICENSE').unlink()
+        with self.assertRaisesRegex(ValueError, re.escape('hyper ' + self.locked['hyper']['version'])):
+            self.generate()
 
     def test_fixture_root_direct_and_transitive_identities_match_actual_lock(self):
         self.assertEqual(self.metadata['packages'][0]['name'], self.root_lock['name'])

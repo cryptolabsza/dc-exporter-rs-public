@@ -519,6 +519,309 @@ fn should_collect_register_telemetry(gpu: &GpuMetrics, register_available: bool)
         && gpu.architecture.use_register_access()
 }
 
+// TRACEWEAVER: entrypoint=build_passthrough_evidence; req=VM-FIX-001,VM-FIX-002; trace=TRACE-VM-001,TRACE-VM-002
+fn build_passthrough_evidence(
+    pci_gpus: &[PciGpuInfo], qemu_pci: &HashSet<String>, virsh_passthrough: &[String],
+) -> HashSet<String> {
+    let mut confirmed_passthrough: HashSet<String> = HashSet::new();
+
+    // Evidence source 1: vfio-pci/pci-stub driver binding (already in PciGpuInfo)
+    for gpu in pci_gpus {
+        if let Some(ref driver) = gpu.bound_driver {
+            if is_passthrough_driver(driver) {
+                confirmed_passthrough.insert(gpu.pci_bus_id.clone());
+                debug!("Passthrough evidence [driver={}]: {}", driver, gpu.pci_bus_id);
+            }
+        }
+    }
+
+    // Evidence source 2: QEMU process command lines
+    for pci_id in qemu_pci {
+        confirmed_passthrough.insert(pci_id.clone());
+        debug!("Passthrough evidence [qemu]: {}", pci_id);
+    }
+
+    // Evidence source 3: virsh dumpxml (GPUs mapped to running VMs)
+    // The VmMetricsCollector already identified these - any GPU that returned VM metrics
+    // is confirmed passthrough. Additionally, check virsh directly for VMs without guest agent.
+    for pci_id in virsh_passthrough {
+        confirmed_passthrough.insert(pci_id.clone());
+        debug!("Passthrough evidence [virsh]: {}", pci_id);
+    }
+
+    // Evidence source 4: Not in /proc but nvidia driver IS loaded
+    // If nvidia driver is loaded and a GPU does NOT appear in /proc/driver/nvidia/gpus/,
+    // the GPU was intentionally unbound from nvidia (passthrough preparation)
+    let nvidia_driver_loaded = pci_gpus.iter().any(|g| g.proc_health.is_some());
+    if nvidia_driver_loaded {
+        for gpu in pci_gpus {
+            if gpu.proc_health.is_none() && gpu.bound_driver.as_deref() != Some("nvidia") {
+                // GPU not in /proc AND not bound to nvidia = likely passthrough
+                // (but only if we don't already have it as a different state)
+                debug!("Passthrough evidence [not-in-proc, no nvidia driver]: {}", gpu.pci_bus_id);
+                confirmed_passthrough.insert(gpu.pci_bus_id.clone());
+            }
+        }
+    }
+
+    confirmed_passthrough
+}
+
+// TRACEWEAVER: entrypoint=merge_gpu_snapshot; req=VM-FIX-001,VM-FIX-003,VM-FIX-004,VM-FIX-005; trace=TRACE-VM-001,TRACE-VM-003,TRACE-VM-004,TRACE-VM-005
+fn merge_gpu_snapshot(
+    pci_gpus: &[PciGpuInfo],
+    mut nvml_metrics: HashMap<String, GpuMetrics>,
+    vm_metrics: &HashMap<u32, GpuMetrics>,
+    confirmed_passthrough: &HashSet<String>,
+    nvml_initialized: bool,
+    driver_version: &str,
+    dmesg_errors: &super::dmesg::DmesgGpuErrors,
+    evidence_tracker: &Mutex<HardwareEvidenceTracker>,
+    register_available: bool,
+    mut reader: impl FnMut(u64, u64) -> super::register::RegisterTemps,
+) -> Vec<GpuMetrics> {
+    let mut gpus = Vec::with_capacity(pci_gpus.len());
+
+    for (pci_index, pci_gpu) in pci_gpus.iter().enumerate() {
+        let pci_index = pci_index as u32;
+        let has_passthrough_evidence = confirmed_passthrough.contains(&pci_gpu.pci_bus_id);
+
+        let mut gpu = if let Some(mut nvml_gpu) = nvml_metrics.remove(&pci_gpu.pci_bus_id) {
+            // 1. GPU is accessible via NVML (on host)
+            nvml_gpu.index = pci_index;
+
+            // A persistent NVML handle can continue returning stale values after a GPU
+            // falls off the bus. Only override current NVML data when this collection
+            // also failed an essential query; historical dmesg alone is not sufficient.
+            nvml_gpu = {
+                let mut evidence_tracker = evidence_tracker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                reconcile_nvml_hardware_evidence(
+                    nvml_gpu,
+                    pci_gpu,
+                    &dmesg_errors,
+                    &mut evidence_tracker,
+                )
+            };
+
+            // Try direct register access for VRAM/hotspot temps
+            if should_collect_register_telemetry(&nvml_gpu, register_available) {
+                collect_host_register_temps_with(&mut nvml_gpu, pci_gpu, register_available, has_passthrough_evidence, &mut reader);
+            }
+
+            nvml_gpu
+        } else if let Some(vm_gpu) = vm_metrics.get(&pci_index) {
+            // 2. GPU is in VM - got metrics from guest agent
+            debug!("GPU {} using VM metrics (VRAM: {:?}, Hotspot: {:?})",
+                pci_index, vm_gpu.vram_temp, vm_gpu.hotspot_temp);
+            vm_gpu.clone()
+        } else if let Some(reason) = {
+            let mut evidence_tracker = evidence_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active_hardware_failure_reason(
+                pci_gpu,
+                &dmesg_errors,
+                &mut evidence_tracker,
+            )
+        } {
+            // 3. Confirmed hardware failure (dmesg RmInitAdapter, broken VBIOS, etc.)
+            // This takes priority over passthrough evidence because a defective GPU
+            // should never be silently classified as "in a VM"
+            warn!("GPU {} ({}) - CONFIRMED HARDWARE FAILURE: {}",
+                pci_index, pci_gpu.pci_bus_id, reason);
+            create_hardware_failure_gpu(pci_index, pci_gpu, &driver_version, &reason, &dmesg_errors)
+        } else if has_passthrough_evidence {
+            // 4. Positive evidence of VM passthrough
+            // At least one source confirmed: vfio-pci/pci-stub driver, QEMU process,
+            // virsh dumpxml, or not in /proc when nvidia is loaded
+            debug!("GPU {} ({}) has passthrough evidence - confirmed VM passthrough",
+                pci_index, pci_gpu.pci_bus_id);
+            create_passthrough_gpu(pci_index, pci_gpu, &driver_version)
+        } else if !nvml_initialized {
+            // 5. NVML failed to initialize entirely (driver error)
+            warn!("GPU {} ({}) - NVML failed, marking as Error (driver issue)",
+                pci_index, pci_gpu.pci_bus_id);
+            create_error_gpu(pci_index, pci_gpu, &driver_version)
+        } else {
+            // 6. NVML initialized but GPU not found, NO passthrough evidence
+            // This is NOT passthrough - it's an error or unavailable state
+            warn!("GPU {} ({}) not in NVML, no passthrough evidence (driver={:?}, in_proc={}) - marking as Error",
+                pci_index, pci_gpu.pci_bus_id, pci_gpu.bound_driver, pci_gpu.proc_health.is_some());
+            create_error_gpu(pci_index, pci_gpu, &driver_version)
+        };
+
+        enrich_pci_gpu_snapshot(&mut gpu,pci_gpu,&dmesg_errors);
+        gpus.push(gpu);
+    }
+    gpus
+}
+
+/// Add VRAM and hotspot temps via direct register access
+fn collect_host_register_temps_with(
+    gpu: &mut GpuMetrics,
+    pci_gpu: &PciGpuInfo,
+    register_available: bool,
+    _has_assignment: bool,
+    mut reader: impl FnMut(u64, u64) -> super::register::RegisterTemps,
+) {
+    if !should_collect_register_telemetry(gpu, register_available) {
+        return;
+    }
+    // Check if this GPU supports register access
+    let gpu_info = match get_gpu_info(pci_gpu.device_id) {
+        Some(info) => info,
+        None => {
+            debug!(
+                "GPU {} (device_id=0x{:04X}) not in supported list for register access",
+                pci_gpu.pci_bus_id, pci_gpu.device_id
+            );
+            return;
+        }
+    };
+
+    // Get BAR0 address
+    let bar0_addr = match pci_gpu.bar0_addr {
+        Some(addr) => addr,
+        None => {
+            debug!("No BAR0 address for GPU {}", pci_gpu.pci_bus_id);
+            return;
+        }
+    };
+
+    // Read temperatures
+    let temps = reader(bar0_addr, gpu_info.vram_offset);
+
+    if let Some(vram) = temps.vram_temp {
+        gpu.vram_temp = Some(vram);
+        gpu.vram_temp_approximated = false;
+        gpu.vram_thermal = Some(super::thermal::ThermalMetadata { backend: super::thermal::ThermalBackend::Legacy, status: super::thermal::ThermalStatus::Valid });
+        debug!("GPU {}: VRAM temp = {}°C (via register)", gpu.index, vram);
+    }
+
+    if let Some(hotspot) = temps.hotspot_temp {
+        gpu.hotspot_temp = Some(hotspot);
+        gpu.hotspot_temp_approximated = false;
+        debug!("GPU {}: Hotspot temp = {}°C (via register)", gpu.index, hotspot);
+    }
+}
+
+/// Create metrics for a GPU with confirmed hardware failure
+fn create_hardware_failure_gpu(
+    index: u32,
+    pci_gpu: &PciGpuInfo,
+    driver_version: &str,
+    failure_reason: &str,
+    dmesg_errors: &super::dmesg::DmesgGpuErrors,
+) -> GpuMetrics {
+    // Try to get UUID and name from /proc if available
+    let (name, uuid) = if let Some(ref health) = pci_gpu.proc_health {
+        (
+            health.model.clone().unwrap_or_else(|| format!("GPU-{:04X}-HW-FAIL", pci_gpu.device_id)),
+            health.uuid.clone().unwrap_or_else(|| "HW-FAILURE".to_string()),
+        )
+    } else {
+        (
+            format!("GPU-{:04X}-HW-FAIL", pci_gpu.device_id),
+            "HW-FAILURE".to_string(),
+        )
+    };
+
+    let mut gpu = GpuMetrics {
+        index,
+        name,
+        uuid,
+        pci_bus_id: pci_gpu.pci_bus_id.clone(),
+        driver_version: driver_version.to_string(),
+        state: GpuState::HardwareFailure,
+        architecture: GpuArchitecture::Unknown,
+        source: MetricSource::Pci,
+        hardware_failure_reason: Some(failure_reason.to_string()),
+        dmesg_hardware_failure: true,
+        bound_driver: pci_gpu.bound_driver.clone(),
+        ..Default::default()
+    };
+
+    // Copy dmesg error details
+    if let Some(dmesg_info) = dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
+        gpu.dmesg_rm_init_failed = dmesg_info.rm_init_adapter_failed;
+        gpu.fallen_off_bus = dmesg_info.fallen_off_bus;
+        gpu.xid_errors = dmesg_info.xid_errors.clone();
+    }
+
+    gpu
+}
+
+/// Create metrics for a GPU in VM passthrough
+fn create_passthrough_gpu(index: u32, pci_gpu: &PciGpuInfo, driver_version: &str) -> GpuMetrics {
+    debug!(
+        "GPU {} ({}) not in NVML - marking as VM passthrough (driver={:?})",
+        index, pci_gpu.pci_bus_id, pci_gpu.bound_driver
+    );
+
+    GpuMetrics {
+        index,
+        name: format!("GPU-{:04X}-VM", pci_gpu.device_id),
+        uuid: "VM-PASSTHROUGH".to_string(),
+        pci_bus_id: pci_gpu.pci_bus_id.clone(),
+        driver_version: driver_version.to_string(),
+        state: GpuState::VmPassthrough,
+        architecture: GpuArchitecture::Unknown,
+        source: MetricSource::Pci,
+        bound_driver: pci_gpu.bound_driver.clone(),
+        // All metrics unavailable for passthrough GPUs
+        gpu_temp: None,
+        vram_temp: None,
+        hotspot_temp: None,
+        power_usage: None,
+        sm_clock: None,
+        mem_clock: None,
+        gpu_util: None,
+        mem_util: None,
+        fb_used: None,
+        fb_free: None,
+        fan_speed: None,
+        aer_errors: 0,
+        ..Default::default()
+    }
+}
+
+/// Create metrics for a GPU that's inaccessible due to driver error
+/// This is different from VM passthrough - the GPU is present but the driver failed
+fn create_error_gpu(index: u32, pci_gpu: &PciGpuInfo, driver_version: &str) -> GpuMetrics {
+    warn!(
+        "GPU {} ({}) - NVML failed to initialize, marking as Error (driver={:?})",
+        index, pci_gpu.pci_bus_id, pci_gpu.bound_driver
+    );
+
+    GpuMetrics {
+        index,
+        name: format!("GPU-{:04X}-ERROR", pci_gpu.device_id),
+        uuid: "DRIVER-ERROR".to_string(),
+        pci_bus_id: pci_gpu.pci_bus_id.clone(),
+        driver_version: driver_version.to_string(),
+        state: GpuState::Error,  // Error state, not VM Passthrough
+        architecture: GpuArchitecture::Unknown,
+        source: MetricSource::Pci,
+        bound_driver: pci_gpu.bound_driver.clone(),
+        // All metrics unavailable due to driver error
+        gpu_temp: None,
+        vram_temp: None,
+        hotspot_temp: None,
+        power_usage: None,
+        sm_clock: None,
+        mem_clock: None,
+        gpu_util: None,
+        mem_util: None,
+        fb_used: None,
+        fb_free: None,
+        fan_speed: None,
+        aer_errors: 0,
+        ..Default::default()
+    }
+}
+
 impl MetricsCollectorSync {
     fn new(
         nvml_timeout: Duration,
@@ -563,7 +866,7 @@ impl MetricsCollectorSync {
         
         debug!("NVML returned {} GPU records, initialized={}", nvml_gpus, nvml_initialized);
 
-        let (mut nvml_metrics,identity_diagnostics)=reconcile_nvml_inventory(nvml_result.gpus,&pci_gpus);
+        let (nvml_metrics,identity_diagnostics)=reconcile_nvml_inventory(nvml_result.gpus,&pci_gpus);
         nvml_unmatched_errors.extend(identity_diagnostics);
 
         // Step 4: Collect VM metrics for GPUs passed through to VMs
@@ -582,49 +885,10 @@ impl MetricsCollectorSync {
         //   2. QEMU process has this PCI address in command line
         //   3. virsh dumpxml shows this GPU passed to a running VM
         //   4. Not in /proc/driver/nvidia/gpus/ when nvidia driver IS loaded (unbound from nvidia)
-        let mut confirmed_passthrough: HashSet<String> = HashSet::new();
-        
-        // Evidence source 1: vfio-pci/pci-stub driver binding (already in PciGpuInfo)
-        for gpu in &pci_gpus {
-            if let Some(ref driver) = gpu.bound_driver {
-                if is_passthrough_driver(driver) {
-                    confirmed_passthrough.insert(gpu.pci_bus_id.clone());
-                    debug!("Passthrough evidence [driver={}]: {}", driver, gpu.pci_bus_id);
-                }
-            }
-        }
-        
-        // Evidence source 2: QEMU process command lines
         let qemu_pci = scan_qemu_passthrough_pci();
-        for pci_id in &qemu_pci {
-            confirmed_passthrough.insert(pci_id.clone());
-            debug!("Passthrough evidence [qemu]: {}", pci_id);
-        }
-        
-        // Evidence source 3: virsh dumpxml (GPUs mapped to running VMs)
-        // The VmMetricsCollector already identified these - any GPU that returned VM metrics
-        // is confirmed passthrough. Additionally, check virsh directly for VMs without guest agent.
         let virsh_passthrough = VmMetricsCollector::get_all_passthrough_pci_ids();
-        for pci_id in &virsh_passthrough {
-            confirmed_passthrough.insert(pci_id.clone());
-            debug!("Passthrough evidence [virsh]: {}", pci_id);
-        }
-        
-        // Evidence source 4: Not in /proc but nvidia driver IS loaded
-        // If nvidia driver is loaded and a GPU does NOT appear in /proc/driver/nvidia/gpus/,
-        // the GPU was intentionally unbound from nvidia (passthrough preparation)
-        let nvidia_driver_loaded = pci_gpus.iter().any(|g| g.proc_health.is_some());
-        if nvidia_driver_loaded {
-            for gpu in &pci_gpus {
-                if gpu.proc_health.is_none() && gpu.bound_driver.as_deref() != Some("nvidia") {
-                    // GPU not in /proc AND not bound to nvidia = likely passthrough
-                    // (but only if we don't already have it as a different state)
-                    debug!("Passthrough evidence [not-in-proc, no nvidia driver]: {}", gpu.pci_bus_id);
-                    confirmed_passthrough.insert(gpu.pci_bus_id.clone());
-                }
-            }
-        }
-        
+        let confirmed_passthrough = build_passthrough_evidence(&pci_gpus, &qemu_pci, &virsh_passthrough);
+
         if !confirmed_passthrough.is_empty() {
             info!("Confirmed passthrough GPUs: {:?}", confirmed_passthrough);
         }
@@ -647,84 +911,12 @@ impl MetricsCollectorSync {
         //   3. Hardware failure signals → HardwareFailure (dmesg/proc evidence)
         //   4. In confirmed_passthrough set → VmPassthrough (positive evidence)
         //   5. Everything else → Error/Unavailable (NEVER assume passthrough without evidence)
-        let mut gpus = Vec::with_capacity(pci_gpus.len());
-        let register_available = self.enable_register_access && is_dev_mem_accessible();
-
-        for (pci_index, pci_gpu) in pci_gpus.iter().enumerate() {
-            let pci_index = pci_index as u32;
-            let has_passthrough_evidence = confirmed_passthrough.contains(&pci_gpu.pci_bus_id);
-            
-            let mut gpu = if let Some(mut nvml_gpu) = nvml_metrics.remove(&pci_gpu.pci_bus_id) {
-                // 1. GPU is accessible via NVML (on host)
-                nvml_gpu.index = pci_index;
-
-                // A persistent NVML handle can continue returning stale values after a GPU
-                // falls off the bus. Only override current NVML data when this collection
-                // also failed an essential query; historical dmesg alone is not sufficient.
-                nvml_gpu = {
-                    let mut evidence_tracker = self
-                        .hardware_evidence_tracker
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    reconcile_nvml_hardware_evidence(
-                        nvml_gpu,
-                        pci_gpu,
-                        &dmesg_errors,
-                        &mut evidence_tracker,
-                    )
-                };
-                
-                // Try direct register access for VRAM/hotspot temps
-                if should_collect_register_telemetry(&nvml_gpu, register_available) {
-                    self.add_register_temps(&mut nvml_gpu, pci_gpu);
-                }
-                
-                nvml_gpu
-            } else if let Some(vm_gpu) = vm_metrics.get(&pci_index) {
-                // 2. GPU is in VM - got metrics from guest agent
-                debug!("GPU {} using VM metrics (VRAM: {:?}, Hotspot: {:?})", 
-                    pci_index, vm_gpu.vram_temp, vm_gpu.hotspot_temp);
-                vm_gpu.clone()
-            } else if let Some(reason) = {
-                let mut evidence_tracker = self
-                    .hardware_evidence_tracker
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                active_hardware_failure_reason(
-                    pci_gpu,
-                    &dmesg_errors,
-                    &mut evidence_tracker,
-                )
-            } {
-                // 3. Confirmed hardware failure (dmesg RmInitAdapter, broken VBIOS, etc.)
-                // This takes priority over passthrough evidence because a defective GPU
-                // should never be silently classified as "in a VM"
-                warn!("GPU {} ({}) - CONFIRMED HARDWARE FAILURE: {}",
-                    pci_index, pci_gpu.pci_bus_id, reason);
-                self.create_hardware_failure_gpu(pci_index, pci_gpu, &driver_version, &reason, &dmesg_errors)
-            } else if has_passthrough_evidence {
-                // 4. Positive evidence of VM passthrough
-                // At least one source confirmed: vfio-pci/pci-stub driver, QEMU process, 
-                // virsh dumpxml, or not in /proc when nvidia is loaded
-                debug!("GPU {} ({}) has passthrough evidence - confirmed VM passthrough",
-                    pci_index, pci_gpu.pci_bus_id);
-                self.create_passthrough_gpu(pci_index, pci_gpu, &driver_version)
-            } else if !nvml_initialized {
-                // 5. NVML failed to initialize entirely (driver error)
-                warn!("GPU {} ({}) - NVML failed, marking as Error (driver issue)", 
-                    pci_index, pci_gpu.pci_bus_id);
-                self.create_error_gpu(pci_index, pci_gpu, &driver_version)
-            } else {
-                // 6. NVML initialized but GPU not found, NO passthrough evidence
-                // This is NOT passthrough - it's an error or unavailable state
-                warn!("GPU {} ({}) not in NVML, no passthrough evidence (driver={:?}, in_proc={}) - marking as Error",
-                    pci_index, pci_gpu.pci_bus_id, pci_gpu.bound_driver, pci_gpu.proc_health.is_some());
-                self.create_error_gpu(pci_index, pci_gpu, &driver_version)
-            };
-            
-            enrich_pci_gpu_snapshot(&mut gpu,pci_gpu,&dmesg_errors);
-            gpus.push(gpu);
-        }
+        let gpus = merge_gpu_snapshot(
+            &pci_gpus, nvml_metrics, &vm_metrics, &confirmed_passthrough,
+            nvml_initialized, &driver_version, &dmesg_errors,
+            &self.hardware_evidence_tracker,
+            self.enable_register_access && is_dev_mem_accessible(), read_gpu_temps,
+        );
         // Step 6: Collect system metrics
         let apt_upgradable = count_apt_upgradable();
         AllMetrics {
@@ -737,162 +929,6 @@ impl MetricsCollectorSync {
             apt_upgradable,
             timestamp,
             nvml_unmatched_errors,
-        }
-    }
-
-    /// Add VRAM and hotspot temps via direct register access
-    fn add_register_temps(&self, gpu: &mut GpuMetrics, pci_gpu: &PciGpuInfo) {
-        // Check if this GPU supports register access
-        let gpu_info = match get_gpu_info(pci_gpu.device_id) {
-            Some(info) => info,
-            None => {
-                debug!(
-                    "GPU {} (device_id=0x{:04X}) not in supported list for register access",
-                    pci_gpu.pci_bus_id, pci_gpu.device_id
-                );
-                return;
-            }
-        };
-
-        // Get BAR0 address
-        let bar0_addr = match pci_gpu.bar0_addr {
-            Some(addr) => addr,
-            None => {
-                debug!("No BAR0 address for GPU {}", pci_gpu.pci_bus_id);
-                return;
-            }
-        };
-
-        // Read temperatures
-        let temps = read_gpu_temps(bar0_addr, gpu_info.vram_offset);
-        
-        if let Some(vram) = temps.vram_temp {
-            gpu.vram_temp = Some(vram);
-            gpu.vram_temp_approximated = false;
-            gpu.vram_thermal = Some(super::thermal::ThermalMetadata { backend: super::thermal::ThermalBackend::Legacy, status: super::thermal::ThermalStatus::Valid });
-            debug!("GPU {}: VRAM temp = {}°C (via register)", gpu.index, vram);
-        }
-        
-        if let Some(hotspot) = temps.hotspot_temp {
-            gpu.hotspot_temp = Some(hotspot);
-            gpu.hotspot_temp_approximated = false;
-            debug!("GPU {}: Hotspot temp = {}°C (via register)", gpu.index, hotspot);
-        }
-    }
-
-    /// Create metrics for a GPU with confirmed hardware failure
-    fn create_hardware_failure_gpu(
-        &self,
-        index: u32,
-        pci_gpu: &PciGpuInfo,
-        driver_version: &str,
-        failure_reason: &str,
-        dmesg_errors: &super::dmesg::DmesgGpuErrors,
-    ) -> GpuMetrics {
-        // Try to get UUID and name from /proc if available
-        let (name, uuid) = if let Some(ref health) = pci_gpu.proc_health {
-            (
-                health.model.clone().unwrap_or_else(|| format!("GPU-{:04X}-HW-FAIL", pci_gpu.device_id)),
-                health.uuid.clone().unwrap_or_else(|| "HW-FAILURE".to_string()),
-            )
-        } else {
-            (
-                format!("GPU-{:04X}-HW-FAIL", pci_gpu.device_id),
-                "HW-FAILURE".to_string(),
-            )
-        };
-        
-        let mut gpu = GpuMetrics {
-            index,
-            name,
-            uuid,
-            pci_bus_id: pci_gpu.pci_bus_id.clone(),
-            driver_version: driver_version.to_string(),
-            state: GpuState::HardwareFailure,
-            architecture: GpuArchitecture::Unknown,
-            source: MetricSource::Pci,
-            hardware_failure_reason: Some(failure_reason.to_string()),
-            dmesg_hardware_failure: true,
-            bound_driver: pci_gpu.bound_driver.clone(),
-            ..Default::default()
-        };
-        
-        // Copy dmesg error details
-        if let Some(dmesg_info) = dmesg_errors.per_gpu.get(&pci_gpu.pci_bus_id) {
-            gpu.dmesg_rm_init_failed = dmesg_info.rm_init_adapter_failed;
-            gpu.fallen_off_bus = dmesg_info.fallen_off_bus;
-            gpu.xid_errors = dmesg_info.xid_errors.clone();
-        }
-        
-        gpu
-    }
-
-    /// Create metrics for a GPU in VM passthrough
-    fn create_passthrough_gpu(&self, index: u32, pci_gpu: &PciGpuInfo, driver_version: &str) -> GpuMetrics {
-        debug!(
-            "GPU {} ({}) not in NVML - marking as VM passthrough (driver={:?})",
-            index, pci_gpu.pci_bus_id, pci_gpu.bound_driver
-        );
-        
-        GpuMetrics {
-            index,
-            name: format!("GPU-{:04X}-VM", pci_gpu.device_id),
-            uuid: "VM-PASSTHROUGH".to_string(),
-            pci_bus_id: pci_gpu.pci_bus_id.clone(),
-            driver_version: driver_version.to_string(),
-            state: GpuState::VmPassthrough,
-            architecture: GpuArchitecture::Unknown,
-            source: MetricSource::Pci,
-            bound_driver: pci_gpu.bound_driver.clone(),
-            // All metrics unavailable for passthrough GPUs
-            gpu_temp: None,
-            vram_temp: None,
-            hotspot_temp: None,
-            power_usage: None,
-            sm_clock: None,
-            mem_clock: None,
-            gpu_util: None,
-            mem_util: None,
-            fb_used: None,
-            fb_free: None,
-            fan_speed: None,
-            aer_errors: 0,
-            ..Default::default()
-        }
-    }
-    
-    /// Create metrics for a GPU that's inaccessible due to driver error
-    /// This is different from VM passthrough - the GPU is present but the driver failed
-    fn create_error_gpu(&self, index: u32, pci_gpu: &PciGpuInfo, driver_version: &str) -> GpuMetrics {
-        warn!(
-            "GPU {} ({}) - NVML failed to initialize, marking as Error (driver={:?})",
-            index, pci_gpu.pci_bus_id, pci_gpu.bound_driver
-        );
-        
-        GpuMetrics {
-            index,
-            name: format!("GPU-{:04X}-ERROR", pci_gpu.device_id),
-            uuid: "DRIVER-ERROR".to_string(),
-            pci_bus_id: pci_gpu.pci_bus_id.clone(),
-            driver_version: driver_version.to_string(),
-            state: GpuState::Error,  // Error state, not VM Passthrough
-            architecture: GpuArchitecture::Unknown,
-            source: MetricSource::Pci,
-            bound_driver: pci_gpu.bound_driver.clone(),
-            // All metrics unavailable due to driver error
-            gpu_temp: None,
-            vram_temp: None,
-            hotspot_temp: None,
-            power_usage: None,
-            sm_clock: None,
-            mem_clock: None,
-            gpu_util: None,
-            mem_util: None,
-            fb_used: None,
-            fb_free: None,
-            fan_speed: None,
-            aer_errors: 0,
-            ..Default::default()
         }
     }
 }
@@ -1993,7 +2029,7 @@ mod tests {
             assert!(snapshot.gpus.iter().all(|gpu|gpu.uuid!="GPU-SYNTHETIC-3"));
             let collector=MetricsCollectorSync::new(Duration::from_millis(1),false,Arc::new(Mutex::new(HardwareEvidenceTracker::default())));
             // Independently supplied PCI fallback is constructed by the actual fallback adapter.
-            let fallback=collector.create_error_gpu(99,&pci_gpu("0000:53:00.0"),"615.71.09");
+            let fallback=create_error_gpu(99,&pci_gpu("0000:53:00.0"),"615.71.09");
             assert_eq!(fallback.state.as_u8(),2);assert!(!should_collect_register_telemetry(&fallback,true));
             let mut gpus=snapshot.gpus;gpus.push(fallback);
             let metrics=AllMetrics {hostname:"fixture-host".into(),total_pci_gpus:8,nvml_gpus:7,gpus,nvml_unmatched_errors:snapshot.unmatched_errors,..Default::default()};
@@ -2024,7 +2060,7 @@ mod tests {
         let (joined,diagnostics)=reconcile_nvml_inventory(native.gpus,&inventory);
         assert_eq!(joined.len(),7);assert!(!diagnostics.is_empty());
         let collector=MetricsCollectorSync::new(Duration::from_millis(1),false,Arc::new(Mutex::new(HardwareEvidenceTracker::default())));
-        let mut gpus:Vec<_>=joined.into_values().collect();gpus.push(collector.create_error_gpu(99,&inventory[3],"615.71.09"));
+        let mut gpus:Vec<_>=joined.into_values().collect();gpus.push(create_error_gpu(99,&inventory[3],"615.71.09"));
         let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus,nvml_gpus:8,total_pci_gpus:8,nvml_unmatched_errors:diagnostics,..Default::default()});
         assert_eq!(output.lines().filter(|l|l.starts_with("GPU_ERROR_STATE{")).count(),8);
         assert!(!output.lines().any(|l|l.starts_with("GPU_ERROR_STATE{") && l.contains("GPU-SYNTHETIC-3")));
@@ -2116,7 +2152,7 @@ mod tests {
             let mut history=successful_empty_dmesg();super::super::dmesg::parse_lines("NVRM: Xid (PCI:0000:53:00): 109, omitted\nNVRM: Xid (PCI:0000:53:00): 119, omitted\nNVRM: Xid (PCI:0000:53:00): 154, omitted",&mut history);
             let mut tracker=HardwareEvidenceTracker::from_boot_log(&history);canonicalize_dmesg_inventory(&mut history,&inventory,&mut tracker);
             let gpus:Vec<_>=inventory.iter().enumerate().map(|(i,pci)|{
-                let mut gpu=joined.remove(&pci.pci_bus_id).unwrap_or_else(||collector.create_error_gpu(i as u32,pci,"615.71.09"));
+                let mut gpu=joined.remove(&pci.pci_bus_id).unwrap_or_else(||create_error_gpu(i as u32,pci,"615.71.09"));
                 enrich_pci_gpu_snapshot(&mut gpu,pci,&history);gpu
             }).collect();
             assert_eq!(gpus[3].state.as_u8(),2);assert_eq!(gpus[3].xid_errors,vec![109,119,154],"{query} fallback loses observed numeric Xids");
@@ -2124,7 +2160,7 @@ mod tests {
             assert_eq!(output.lines().filter(|l|l.starts_with("GPU_ERROR_STATE{")).count(),8);
             for code in [109,119,154] {assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_XID_CODE{") && l.contains("pci_bus_id=\"0000:53:00.0\"") && l.contains(&format!("code=\"{code}\""))));}
             assert!(!output.lines().any(|l|l.starts_with("DCGM_FI_DEV_POWER_USAGE{") && l.contains("gpu=\"3\"")));
-            let mut passthrough=collector.create_passthrough_gpu(3,&inventory[3],"615.71.09");
+            let mut passthrough=create_passthrough_gpu(3,&inventory[3],"615.71.09");
             enrich_pci_gpu_snapshot(&mut passthrough,&inventory[3],&history);assert_eq!(passthrough.state.as_u8(),3);assert_eq!(passthrough.xid_errors,vec![109,119,154]);
         }
     }
@@ -2170,6 +2206,199 @@ mod tests {
         assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&ambiguous,&mut fresh).state.as_u8(),1);
         canonicalize_dmesg_inventory(&mut new_raw,&[pci.clone()],&mut fresh);
         assert_eq!(reconcile_nvml_hardware_evidence(health_definition_recovery_gpu(Ok(0)),&pci,&new_raw,&mut fresh).state.as_u8(),5,"unassigned new raw events must remain pending until identity resolves");
+    }
+
+
+    // TRACEWEAVER: verifies=VER-VM-001; req=VM-FIX-001; trace=TRACE-VM-001
+    #[test]
+    fn vm_definition_missing_proc_is_error_with_or_without_sibling_and_nvml_initialization() {
+        for binding in [None, Some("nouveau")] {
+            for sibling_present in [false, true] {
+                for nvml_initialized in [false, true] {
+                    let mut missing = pci_gpu("0000:23:00.0");
+                    missing.bound_driver = binding.map(str::to_string);
+                    missing.in_nvml = false;
+                    let mut inventory = vec![missing];
+                    let mut nvml = Vec::new();
+                    if sibling_present {
+                        let mut sibling = pci_gpu("0000:41:00.0");
+                        sibling.proc_health = Some(ProcGpuHealth {
+                            model: Some("fixture sibling".into()), uuid: Some("GPU-SIBLING".into()),
+                            video_bios: None, firmware: None, is_healthy: true, failure_reason: None,
+                        });
+                        inventory.push(sibling);
+                        if nvml_initialized {
+                            let mut healthy = stale_nvml_gpu("0000:41:00.0");
+                            healthy.uuid = "GPU-SIBLING".into();
+                            healthy.state = GpuState::Ok;
+                            healthy.nvml_essential_query_failed = false;
+                            nvml.push(healthy);
+                        }
+                    }
+                    let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+                    for _collection in 0..2 {
+                        let assignments = build_passthrough_evidence(&inventory, &HashSet::new(), &[]);
+                        let rows = merge_gpu_snapshot(&inventory, reconcile_nvml_inventory(nvml.clone(), &inventory).0, &HashMap::new(), &assignments,
+                            nvml_initialized, "fixture", &successful_empty_dmesg(), &tracker, false, |_, _| panic!("disabled register reader invoked"));
+                        let missing = &rows[0];
+                        assert_eq!(missing.state, GpuState::Error);
+                        assert_eq!(missing.source, MetricSource::Pci);
+                        assert_eq!((missing.gpu_temp, missing.vram_temp, missing.power_usage), (None, None, None));
+                        let usable = u32::from(sibling_present && nvml_initialized);
+                        assert_eq!(count_usable_gpus(&rows), usable);
+                        let output = PrometheusFormatter::format(&AllMetrics {
+                            hostname: "vm-fixture".into(), total_pci_gpus: inventory.len() as u32,
+                            gpus: rows, ..Default::default()
+                        });
+                        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{")
+                            && l.contains("pci_bus_id=\"0000:23:00.0\"") && l.ends_with(" 2")));
+                        assert!(output.contains(&format!("DCXP_GPU_COUNT{{type=\"usable\",Hostname=\"vm-fixture\"}} {usable}")));
+                        assert!(!output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP{")
+                            && l.contains("pci_bus_id=\"0000:23:00.0\"")));
+                    }
+                }
+            }
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-001; req=VM-FIX-001; trace=TRACE-VM-001
+    #[test]
+    fn vm_definition_assignment_disappearance_does_not_latch_passthrough_or_usable_count() {
+        let mut pci = pci_gpu("0000:23:00.0");
+        pci.bound_driver = None;
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+        for (source, expected, usable) in [
+            (vec!["0000:23:00.0".to_string()], GpuState::VmPassthrough, 1),
+            (Vec::new(), GpuState::Error, 0),
+        ] {
+            let assignments = build_passthrough_evidence(&[pci.clone()], &HashSet::new(), &source);
+            let rows = merge_gpu_snapshot(&[pci.clone()], HashMap::new(), &HashMap::new(), &assignments,
+                false, "fixture", &successful_empty_dmesg(), &tracker, false, |_, _| panic!("disabled register reader invoked"));
+            assert_eq!(rows[0].state, expected);
+            assert_eq!(count_usable_gpus(&rows), usable);
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_independent_explicit_evidence_keeps_agentless_reservation_usable() {
+        for evidence in 0..4 {
+            let mut pci = pci_gpu("0000:23:00.0");
+            pci.bound_driver = match evidence { 0 => Some("vfio-pci".into()), 1 => Some("pci-stub".into()), _ => None };
+            let qemu = if evidence == 2 { HashSet::from([pci.pci_bus_id.clone()]) } else { HashSet::new() };
+            let libvirt = if evidence == 3 { vec![pci.pci_bus_id.clone()] } else { Vec::new() };
+            let assignments = build_passthrough_evidence(&[pci.clone()], &qemu, &libvirt);
+            let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+            let rows = merge_gpu_snapshot(&[pci], HashMap::new(), &HashMap::new(), &assignments,
+                false, "fixture", &successful_empty_dmesg(), &tracker, false, |_, _| panic!("disabled register reader invoked"));
+            assert_eq!(rows[0].state, GpuState::VmPassthrough, "source {evidence}");
+            assert_eq!(rows[0].source, MetricSource::Pci);
+            assert_eq!(rows[0].vram_temp, None);
+            assert_eq!(count_usable_gpus(&rows), 1);
+            let output = PrometheusFormatter::format(&AllMetrics {gpus: rows, ..Default::default()});
+            assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{") && l.ends_with(" 3")));
+            assert!(output.lines().any(|l| l.starts_with("DCXP_FI_DEV_VRAM_TEMP_VALID{") && l.ends_with(" 0")));
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_definition_guest_index_collision_cannot_hide_an_unrelated_host_error() {
+        let mut assigned = pci_gpu("0000:c1:00.0");
+        assigned.bound_driver = Some("vfio-pci".into());
+        let mut unrelated = pci_gpu("0000:01:00.0");
+        unrelated.bound_driver = None;
+        let assignments = HashSet::from([assigned.pci_bus_id.clone()]);
+        let mut guest = stale_nvml_gpu("0000:c1:00.0");
+        guest.index = 1; // stale/colliding guest ordinal, unrelated host row's index
+        guest.source = MetricSource::Vm;
+        guest.state = GpuState::Ok;
+        guest.nvml_essential_query_failed = false;
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+        let rows = merge_gpu_snapshot(&[assigned, unrelated], HashMap::new(), &HashMap::from([(guest.index, guest)]), &assignments,
+            true, "fixture", &successful_empty_dmesg(), &tracker, false, |_, _| panic!("disabled register reader invoked"));
+        assert_eq!(rows[0].pci_bus_id, "0000:c1:00.0");
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].source, MetricSource::Vm);
+        assert_eq!(rows[1].pci_bus_id, "0000:01:00.0");
+        assert_eq!(rows[1].state, GpuState::Error);
+        assert_eq!(rows[1].gpu_temp, None);
+        assert_eq!(count_usable_gpus(&rows), 1);
+        let output = PrometheusFormatter::format(&AllMetrics {gpus: rows, ..Default::default()});
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{")
+            && l.contains("pci_bus_id=\"0000:01:00.0\"") && l.ends_with(" 2")));
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-004; req=VM-FIX-004; trace=TRACE-VM-004
+    #[test]
+    fn vm_definition_current_failure_precedes_agentless_assignment_in_real_merge() {
+        let mut pci = pci_gpu("0000:23:00.0");
+        pci.bound_driver = Some("vfio-pci".into());
+        let assignments = HashSet::from([pci.pci_bus_id.clone()]);
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+        let rows = merge_gpu_snapshot(&[pci], HashMap::new(), &HashMap::new(), &assignments,
+            true, "fixture", &terminal_dmesg("0000:23:00.0"), &tracker, false, |_, _| panic!("disabled register reader invoked"));
+        assert_eq!(rows[0].state, GpuState::HardwareFailure);
+        assert_eq!(count_usable_gpus(&rows), 0);
+        let output = PrometheusFormatter::format(&AllMetrics {gpus: rows, ..Default::default()});
+        assert!(output.lines().any(|l| l.starts_with("DCXP_GPU_STATE{") && l.ends_with(" 5")));
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
+    #[test]
+    fn vm_definition_host_bar_reader_requires_policy_ownership_and_reconciled_identity() {
+        for case in 0..10 {
+            let mut pci = pci_gpu("0000:23:00.0");
+            pci.device_id = 0x2684; // existing 4090 profile; positive control must read
+            let mut gpu = stale_nvml_gpu("0000:23:00.0");
+            gpu.device_id = pci.device_id;
+            gpu.state = GpuState::Ok;
+            gpu.nvml_essential_query_failed = false;
+            gpu.bound_driver = Some("nvidia".into());
+            match case {
+                1 => pci.bound_driver = Some("vfio-pci".into()),
+                2 => pci.bound_driver = None,
+                3 => pci.bound_driver = Some("nouveau".into()),
+                4 => gpu.pci_bus_id = "0000:41:00.0".into(),
+                5 => gpu.device_id = 0x2204,
+                6 => gpu.source = MetricSource::Vm,
+                7 => gpu.nvml_essential_query_failed = true,
+                _ => (),
+            }
+            let mut calls = Vec::new();
+            collect_host_register_temps_with(&mut gpu, &pci, case != 8, case == 9, |bar, offset| {
+                calls.push((bar, offset));
+                super::super::register::RegisterTemps { vram_temp: Some(73), hotspot_temp: Some(81) }
+            });
+            if case == 0 {
+                assert_eq!(calls, vec![(0x1000, super::super::register::offsets::VRAM_TEMP_OFFSET)]);
+                assert_eq!(gpu.vram_temp, Some(73));
+            } else {
+                assert!(calls.is_empty(), "case {case} invoked actual reader seam: {calls:?}");
+            }
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
+    #[test]
+    fn vm_definition_real_merge_retains_owned_host_bar_positive_control() {
+        let mut pci = pci_gpu("0000:23:00.0");
+        pci.device_id = 0x2684;
+        let mut gpu = stale_nvml_gpu(&pci.pci_bus_id);
+        gpu.state = GpuState::Ok;
+        gpu.nvml_essential_query_failed = false;
+        let joined = reconcile_nvml_inventory(vec![gpu], &[pci.clone()]).0;
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+        let mut calls = Vec::new();
+        let rows = merge_gpu_snapshot(&[pci], joined, &HashMap::new(), &HashSet::new(),
+            true, "fixture", &successful_empty_dmesg(), &tracker, true, |bar, offset| {
+                calls.push((bar, offset));
+                super::super::register::RegisterTemps {vram_temp: Some(73), hotspot_temp: Some(81)}
+            });
+        assert_eq!(calls, vec![(0x1000, super::super::register::offsets::VRAM_TEMP_OFFSET)]);
+        assert_eq!(rows[0].vram_temp, Some(73));
+        assert_eq!(rows[0].device_id, 0x2684);
+        assert_eq!(rows[0].bound_driver.as_deref(), Some("nvidia"));
     }
 
 }
