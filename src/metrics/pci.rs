@@ -229,46 +229,51 @@ pub fn is_passthrough_driver(driver: &str) -> bool {
     matches!(driver, "vfio-pci" | "pci-stub")
 }
 
+/// Canonical PCI identity for assignment evidence and guest telemetry.
+pub(super) fn canonical_pci_bus_id(value: &str) -> Option<String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 || !matches!(parts[0].len(), 4 | 8) || parts[1].len() != 2 {
+        return None;
+    }
+    let function: Vec<_> = parts[2].split('.').collect();
+    if function.len() != 2 || function[0].len() != 2 || function[1].len() != 1
+        || !parts[0].bytes().chain(parts[1].bytes()).chain(function[0].bytes()).chain(function[1].bytes()).all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let (domain, bus, slot, function) = parse_pci_bus_id(value)?;
+    (domain <= 0xffff && slot <= 0x1f && function <= 7)
+        .then(|| format_pci_bus_id(domain, bus, slot, function))
+}
+
 // TRACEWEAVER: entrypoint=qemu_passthrough_from_process; req=VM-FIX-002; trace=TRACE-VM-002
 fn qemu_passthrough_from_process(
-    _executable: Option<&Path>, argv: &[String],
+    executable: Option<&Path>, argv: &[String],
 ) -> std::collections::HashSet<String> {
     let mut passthrough_pci = std::collections::HashSet::new();
-    let cmdline = argv.join("\0");
-    // Check if this is a QEMU process
-    if !cmdline.contains("qemu") {
-        return passthrough_pci;
-    }
+    let Some(executable) = executable else { return passthrough_pci; };
+    let Some(name) = executable.file_name().and_then(|name| name.to_str()) else { return passthrough_pci; };
+    let system_bin = executable.parent() == Some(Path::new("/usr/bin"));
+    let system_kvm = name == "qemu-kvm"
+        && (system_bin || executable.parent() == Some(Path::new("/usr/libexec")));
+    let system_qemu = system_bin && name.strip_prefix("qemu-system-").is_some_and(|arch| {
+        !arch.is_empty() && arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    if !system_kvm && !system_qemu { return passthrough_pci; }
 
-    // Parse PCI addresses from QEMU command line
-    // Patterns:
-    //   -device vfio-pci,host=0000:c1:00.0
-    //   -device vfio-pci,host=c1:00.0
-    //   vfio-pci\0host=0000:c1:00.0  (null-separated in /proc/cmdline)
-    let cmdline = cmdline.replace('\0', " ");
-
-    // Find all "host=XXXX:XX:XX.X" patterns
-    for part in cmdline.split(|c: char| c.is_whitespace() || c == ',') {
-        if let Some(addr) = part.strip_prefix("host=") {
-            let addr = addr.trim().to_lowercase();
-            // Normalize: add "0000:" prefix if missing
-            let normalized = if addr.len() == 7 && addr.chars().nth(2) == Some(':') {
-                // Short form like "c1:00.0" → "0000:c1:00.0"
-                format!("0000:{}", addr)
-            } else {
-                addr
-            };
-
-            // Validate it looks like a PCI bus ID
-            if normalized.len() == 12
-                && normalized.chars().nth(4) == Some(':')
-                && normalized.chars().nth(7) == Some(':')
-                && normalized.chars().nth(10) == Some('.')
-            {
-                debug!("QEMU passthrough detected: {}", normalized);
-                passthrough_pci.insert(normalized);
-            }
-        }
+    for (index, argument) in argv.iter().enumerate().skip(1) {
+        let device = if argument == "-device" {
+            argv.get(index + 1).map(String::as_str)
+        } else {
+            argument.strip_prefix("-device=")
+        };
+        let Some(device) = device else { continue; };
+        let mut fields = device.split(',');
+        if fields.next() != Some("vfio-pci") { continue; }
+        let hosts: Vec<_> = fields.filter_map(|field| field.strip_prefix("host=")).collect();
+        if hosts.len() != 1 { continue; }
+        let host = if hosts[0].len() == 7 { format!("0000:{}", hosts[0]) } else { hosts[0].to_string() };
+        if let Some(host) = canonical_pci_bus_id(&host) { passthrough_pci.insert(host); }
     }
     passthrough_pci
 }
@@ -277,8 +282,6 @@ fn qemu_passthrough_from_process(
 /// This works even without libvirt/virsh - it parses QEMU command lines directly.
 /// Returns a set of PCI bus IDs (lowercase, e.g., "0000:c1:00.0") that are in passthrough.
 pub fn scan_qemu_passthrough_pci() -> std::collections::HashSet<String> {
-    use std::process::Command;
-    
     let mut passthrough_pci = std::collections::HashSet::new();
     
     // Read /proc to find all QEMU processes
@@ -291,7 +294,7 @@ pub fn scan_qemu_passthrough_pci() -> std::collections::HashSet<String> {
     for entry in entries.flatten() {
         // Only look at numeric directories (PIDs)
         let name = entry.file_name();
-        let name_str = match name.to_str() {
+        let _name_str = match name.to_str() {
             Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s.to_string(),
             _ => continue,
         };
@@ -307,35 +310,6 @@ pub fn scan_qemu_passthrough_pci() -> std::collections::HashSet<String> {
         let argv: Vec<String> = cmdline.split('\0').map(str::to_string).collect();
         passthrough_pci.extend(qemu_passthrough_from_process(executable.as_deref(), &argv));
 
-    }
-    
-    // Fallback: try `ps aux` if /proc scanning found nothing (some containers)
-    if passthrough_pci.is_empty() {
-        if let Ok(output) = Command::new("ps").args(["aux"]).output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if !line.contains("qemu") {
-                    continue;
-                }
-                for part in line.split(|c: char| c.is_whitespace() || c == ',') {
-                    if let Some(addr) = part.strip_prefix("host=") {
-                        let addr = addr.trim().to_lowercase();
-                        let normalized = if addr.len() == 7 && addr.chars().nth(2) == Some(':') {
-                            format!("0000:{}", addr)
-                        } else {
-                            addr
-                        };
-                        if normalized.len() == 12 
-                            && normalized.chars().nth(4) == Some(':')
-                            && normalized.chars().nth(7) == Some(':')
-                            && normalized.chars().nth(10) == Some('.') 
-                        {
-                            passthrough_pci.insert(normalized);
-                        }
-                    }
-                }
-            }
-        }
     }
     
     if !passthrough_pci.is_empty() {
@@ -446,6 +420,18 @@ mod tests {
             let actual = qemu_passthrough_from_process(exe, &argv);
             assert_eq!(actual, expected.into_iter().map(str::to_string).collect(), "{exe:?} {argv:?}");
         }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_qemu_writable_path_and_deleted_executable_are_not_proof() {
+        let argv = vec!["qemu-system-x86_64".into(), "-device".into(), "vfio-pci,host=0000:c1:00.0".into()];
+        for executable in ["/tmp/qemu-system-x86_64", "/var/tmp/qemu-kvm", "/usr/bin/qemu-system-x86_64 (deleted)"] {
+            assert!(qemu_passthrough_from_process(Some(Path::new(executable)), &argv).is_empty(), "{executable}");
+        }
+        let argv = vec!["qemu-kvm".into(), "-device=vfio-pci,host=0001:C1:00.0".into()];
+        assert_eq!(qemu_passthrough_from_process(Some(Path::new("/usr/libexec/qemu-kvm")), &argv),
+            std::collections::HashSet::from(["0001:c1:00.0".into()]));
     }
 
 }

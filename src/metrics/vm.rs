@@ -7,7 +7,7 @@
 //! 1. Use `virsh list` to find running VMs
 //! 2. Use `virsh dumpxml` to find which GPUs are passed to each VM
 //! 3. Use `virsh qemu-agent-command` to execute nvidia-smi inside the VM
-//! 4. Use guest agent to read VRAM/hotspot temps via sysfs inside VM
+//! Guest BAR temperatures remain disabled until a guest profile is qualified.
 //!
 //! Requirements:
 //! - libvirt/virsh installed on host
@@ -18,12 +18,18 @@
 //! - VM names are validated to prevent command injection
 
 use std::collections::HashMap;
+use quick_xml::{events::{BytesStart, Event}, Reader, XmlVersion};
+use super::pci::canonical_pci_bus_id;
+
 use std::process::Command;
 use base64::Engine;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::state::{GpuState, ThrottleReasons};
 use super::{GpuMetrics, MetricSource};
+
+type VmGpuMappings = HashMap<String, (String, u32, u16)>;
+type VmGpuDomain = (String, Vec<String>, VmGpuMappings);
 
 /// Validate VM name to prevent command injection
 /// Only allows alphanumeric, dash, underscore, and dot characters
@@ -34,38 +40,6 @@ fn is_valid_vm_name(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.starts_with('.')
 }
-
-/// Script to read VRAM/Hotspot temps inside VM via sysfs
-/// Uses mmap on /sys/bus/pci/devices/*/resource0
-const VM_TEMP_READER_PYTHON: &str = r#"
-import os,mmap,struct,json,glob
-r=[]
-for p in sorted(glob.glob("/sys/bus/pci/devices/*/vendor")):
- try:
-  if open(p).read().strip()!="0x10de":continue
-  d=os.path.dirname(p)
-  f=os.open(d+"/resource0",os.O_RDONLY|os.O_SYNC)
-  m=mmap.mmap(f,0,mmap.MAP_SHARED,mmap.PROT_READ)
-  m.seek(0xE2A8);v=(struct.unpack("<I",m.read(4))[0]&0xfff)//32
-  m.seek(0x2046c);h=(struct.unpack("<I",m.read(4))[0]>>8)&0x7f
-  m.close();os.close(f)
-  r.append({"p":os.path.basename(d),"v":v,"h":h})
- except:pass
-print(json.dumps(r))
-"#;
-
-/// Shell fallback for reading temps (works on minimal distros)
-const VM_TEMP_READER_SHELL: &str = r#"
-for d in /sys/bus/pci/devices/*;do
- [ -f "$d/vendor" ]||continue
- read v<"$d/vendor";[ "$v" = "0x10de" ]||continue
- vr=$(dd if="$d/resource0" bs=4 skip=14634 count=1 2>/dev/null|od -An -tu4|tr -d ' ')
- vt=$(((vr&4095)/32))
- hr=$(dd if="$d/resource0" bs=4 skip=33051 count=1 2>/dev/null|od -An -tu4|tr -d ' ')
- ht=$(((hr>>8)&127))
- echo "${d##*/}:$vt:$ht"
-done
-"#;
 
 /// VM metrics collector
 pub struct VmMetricsCollector;
@@ -128,8 +102,16 @@ impl VmMetricsCollector {
             return Vec::new();
         }
 
-        let xml = String::from_utf8_lossy(&output.stdout);
-        parse_vm_gpu_mappings_xml(&xml).into_iter().map(|(host, _)| host).collect()
+        let Ok(xml) = std::str::from_utf8(&output.stdout) else { return Vec::new(); };
+        parse_gpu_passthrough_xml(xml)
+    }
+
+    fn get_vm_gpu_mappings(vm_name: &str) -> (Vec<String>, Vec<(String, String)>) {
+        if !is_valid_vm_name(vm_name) { return (Vec::new(), Vec::new()); }
+        let Ok(output) = Command::new("virsh").args(["dumpxml", vm_name]).output() else { return (Vec::new(), Vec::new()); };
+        if !output.status.success() { return (Vec::new(), Vec::new()); }
+        let Ok(xml) = std::str::from_utf8(&output.stdout) else { return (Vec::new(), Vec::new()); };
+        (parse_gpu_passthrough_xml(xml), parse_vm_gpu_mappings_xml(xml))
     }
 
     /// Execute command inside VM via QEMU guest agent
@@ -221,68 +203,16 @@ impl VmMetricsCollector {
         Some((stdout, exit_code))
     }
 
-    /// Get VRAM/Hotspot temps from inside VM via sysfs
-    pub fn get_vm_gpu_temps(vm_name: &str) -> HashMap<String, (u32, u32)> {
-        Self::get_vm_gpu_temps_with(vm_name, &mut Self::guest_exec)
+    /// Collect only telemetry tied to an unambiguous guest-to-host PCI mapping.
+    pub fn get_vm_gpu_metrics(
+        vm_name: &str, mappings: &VmGpuMappings, enable_register_access: bool,
+    ) -> Vec<GpuMetrics> {
+        Self::get_vm_gpu_metrics_with(vm_name, mappings, enable_register_access, &mut Self::guest_exec)
     }
 
-    fn get_vm_gpu_temps_with(
-        vm_name: &str,
-        guest_exec: &mut impl FnMut(&str, &str, &[&str]) -> Option<(String, i32)>,
-    ) -> HashMap<String, (u32, u32)> {
-        let mut temps = HashMap::new();
-
-        // Try Python first
-        if let Some((stdout, 0)) = guest_exec(
-            vm_name,
-            "/usr/bin/python3",
-            &["-c", VM_TEMP_READER_PYTHON],
-        ) {
-            if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout.trim()) {
-                for r in results {
-                    if let (Some(pci), Some(vram), Some(hotspot)) = (
-                        r.get("p").and_then(|v| v.as_str()),
-                        r.get("v").and_then(|v| v.as_u64()),
-                        r.get("h").and_then(|v| v.as_u64()),
-                    ) {
-                        temps.insert(pci.to_string(), (vram as u32, hotspot as u32));
-                    }
-                }
-                if !temps.is_empty() {
-                    return temps;
-                }
-            }
-        }
-
-        // Fallback to shell
-        if let Some((stdout, 0)) = guest_exec(vm_name, "/bin/sh", &["-c", VM_TEMP_READER_SHELL])
-        {
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 3 {
-                    if let (Ok(vram), Ok(hotspot)) =
-                        (parts[1].parse::<u32>(), parts[2].parse::<u32>())
-                    {
-                        temps.insert(parts[0].to_string(), (vram, hotspot));
-                    }
-                }
-            }
-        }
-
-        temps
-    }
-
-    /// Get GPU metrics from inside VM via nvidia-smi
-    pub fn get_vm_gpu_metrics(vm_name: &str, host_gpu_indices: &[u32]) -> Vec<GpuMetrics> {
-        Self::get_vm_gpu_metrics_with(vm_name, host_gpu_indices, &HashMap::new(), true, &mut Self::guest_exec)
-    }
-
-    // The ordered legacy input is retained until semantic RED demonstrates the
-    // ordinal fallback. Mapping and policy are deliberately not applied yet.
     fn get_vm_gpu_metrics_with(
         vm_name: &str,
-        host_gpu_indices: &[u32],
-        _mappings: &HashMap<String, (String, u32, u16)>,
+        mappings: &VmGpuMappings,
         _enable_register_access: bool,
         guest_exec: &mut impl FnMut(&str, &str, &[&str]) -> Option<(String, i32)>,
     ) -> Vec<GpuMetrics> {
@@ -307,8 +237,18 @@ impl VmMetricsCollector {
             return gpus;
         }
 
-        // Get VRAM/Hotspot temps via sysfs
-        let vm_temps = Self::get_vm_gpu_temps_with(vm_name, guest_exec);
+        // No guest BAR profile has accepted qualification evidence. Even with
+        // register access enabled, nvidia-smi is the only permitted guest query.
+        let mut guest_counts = HashMap::<String, usize>::new();
+        let mut uuid_counts = HashMap::<String, usize>::new();
+        for line in stdout.lines() {
+            let parts: Vec<_> = line.split(',').map(str::trim).collect();
+            if parts.len() < 14 { continue; }
+            if let Some(guest) = canonical_pci_bus_id(parts[3]) {
+                *guest_counts.entry(guest).or_default() += 1;
+            }
+            *uuid_counts.entry(parts[2].to_string()).or_default() += 1;
+        }
 
         // Parse nvidia-smi output
         for line in stdout.lines() {
@@ -317,30 +257,21 @@ impl VmMetricsCollector {
                 continue;
             }
 
-            let vm_gpu_idx: u32 = match parts[0].parse() {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-
-            // Map VM GPU index to host GPU index
-            let host_gpu_idx = host_gpu_indices
-                .get(vm_gpu_idx as usize)
-                .copied()
-                .unwrap_or(vm_gpu_idx);
-
-            // Get VM's PCI bus ID and look up temps
-            let vm_pci_bus = parts[3].replace("00000000:", "0000:");
-            let (vram_temp, hotspot_temp) = vm_temps
-                .iter()
-                .find(|(k, _)| vm_pci_bus.contains(k.as_str()))
-                .map(|(_, v)| *v)
-                .unwrap_or((0, 0));
+            let Some(vm_pci_bus) = canonical_pci_bus_id(parts[3]) else { continue; };
+            if guest_counts.get(&vm_pci_bus) != Some(&1)
+                || parts[2].is_empty() || uuid_counts.get(parts[2]) != Some(&1)
+            { continue; }
+            let Some((host_bdf, host_gpu_idx, device_id)) = mappings.get(&vm_pci_bus) else { continue; };
+            if canonical_pci_bus_id(host_bdf).as_deref() != Some(host_bdf.as_str())
+                || mappings.values().filter(|(host, _, _)| host == host_bdf).count() != 1
+            { continue; }
 
             let mut gpu = GpuMetrics {
-                index: host_gpu_idx,
+                index: *host_gpu_idx,
                 name: parts[1].to_string(),
                 uuid: parts[2].to_string(),
-                pci_bus_id: vm_pci_bus,
+                pci_bus_id: host_bdf.clone(),
+                device_id: *device_id,
                 driver_version: parts.get(13).unwrap_or(&"N/A").to_string(),
                 state: GpuState::Ok,
                 source: MetricSource::Vm,
@@ -357,8 +288,8 @@ impl VmMetricsCollector {
                 sm_clock: parse_metric(parts[11]),
                 mem_clock: parse_metric(parts[12]),
                 
-                vram_temp: if vram_temp > 0 { Some(vram_temp) } else { None },
-                hotspot_temp: if hotspot_temp > 0 { Some(hotspot_temp) } else { None },
+                vram_temp: None,
+                hotspot_temp: None,
                 vram_temp_approximated: false,
                 hotspot_temp_approximated: false,
                 
@@ -402,107 +333,169 @@ impl VmMetricsCollector {
         all_pci
     }
 
-    /// Collect metrics from all running VMs
-    pub fn collect_all(host_gpu_map: &HashMap<String, u32>) -> Vec<GpuMetrics> {
-        if !Self::is_available() {
-            debug!("virsh not available - VM metrics disabled");
-            return Vec::new();
-        }
-
-        let vms = Self::get_running_vms();
-        if vms.is_empty() {
-            debug!("No running VMs found");
-            return Vec::new();
-        }
-
-        let mut all_metrics = Vec::new();
-
-        for vm_name in vms {
-            // Get which host GPUs are passed to this VM
-            let passthrough_pci = Self::get_vm_gpu_passthrough(&vm_name);
-            if passthrough_pci.is_empty() {
-                trace!("VM {} has no GPU passthrough", vm_name);
-                continue;
+    /// Collect metrics only for uniquely mapped GPUs in running domains.
+    pub fn collect_all(
+        host_gpu_map: &HashMap<String, (u32, u16)>, enable_register_access: bool,
+    ) -> Vec<GpuMetrics> {
+        if !Self::is_available() { return Vec::new(); }
+        let mut domains: Vec<VmGpuDomain> = Self::get_running_vms().into_iter().map(|vm| {
+            let (sources, mappings) = Self::get_vm_gpu_mappings(&vm);
+            let mappings = mappings.into_iter().filter_map(|(host, guest)| {
+                host_gpu_map.get(&host).map(|(index, device)| (guest, (host.clone(), *index, *device)))
+            }).collect();
+            (vm, sources, mappings)
+        }).collect();
+        retain_unique_vm_assignments(&mut domains);
+        let mut metrics = Vec::new();
+        for (vm, _, mappings) in domains {
+            if !mappings.is_empty() {
+                metrics.extend(Self::get_vm_gpu_metrics(&vm, &mappings, enable_register_access));
             }
-
-            // Map host PCI addresses to GPU indices
-            let host_indices: Vec<u32> = passthrough_pci
-                .iter()
-                .filter_map(|pci| host_gpu_map.get(pci).copied())
-                .collect();
-
-            debug!(
-                "VM {} has {} passthrough GPUs: {:?}",
-                vm_name,
-                host_indices.len(),
-                passthrough_pci
-            );
-
-            // Collect metrics from inside the VM
-            let vm_metrics = Self::get_vm_gpu_metrics(&vm_name, &host_indices);
-            all_metrics.extend(vm_metrics);
         }
-
-        all_metrics
+        metrics
     }
+}
+
+fn retain_unique_vm_assignments(domains: &mut [VmGpuDomain]) {
+    let mut counts = HashMap::<String, usize>::new();
+    for (_, sources, _) in domains.iter() {
+        for host in sources { *counts.entry(host.clone()).or_default() += 1; }
+    }
+    for (_, _, mappings) in domains {
+        mappings.retain(|_, (host, _, _)| counts.get(host) == Some(&1));
+    }
+}
+
+#[derive(Default)]
+struct VmPciAssignment {
+    host: Option<String>,
+    guest: Option<String>,
+    source_addresses: usize,
+    guest_addresses: usize,
+}
+
+fn xml_attributes(element: &BytesStart<'_>, version: XmlVersion) -> Option<HashMap<String, String>> {
+    let mut attributes = HashMap::new();
+    for attribute in element.attributes() {
+        let attribute = attribute.ok()?;
+        let key = attribute.key.into_inner().to_string();
+        let value = attribute.normalized_value(version).ok()?.into_owned();
+        if attributes.insert(key, value).is_some() { return None; }
+    }
+    Some(attributes)
+}
+
+fn pci_address_attributes(attributes: &HashMap<String, String>) -> Option<String> {
+    let number = |name: &str, maximum: u32| -> Option<u32> {
+        let value = attributes.get(name)?;
+        let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        let value = u32::from_str_radix(value, 16).ok()?;
+        (value <= maximum).then_some(value)
+    };
+    Some(format!("{:04x}:{:02x}:{:02x}.{}", number("domain", 0xffff)?, number("bus", 0xff)?, number("slot", 0x1f)?, number("function", 7)?))
+}
+
+// TRACEWEAVER: entrypoint=parse_vm_hostdev_xml; req=VM-FIX-002,VM-FIX-003; trace=TRACE-VM-002,TRACE-VM-003
+fn parse_vm_hostdev_xml(xml: &str) -> Option<Vec<VmPciAssignment>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().enable_all_checks(true);
+    reader.config_mut().expand_empty_elements = true;
+    let mut stack = Vec::<String>::new();
+    let mut roots = 0;
+    let mut declared = false;
+    let mut version = XmlVersion::Implicit1_0;
+    let mut current: Option<VmPciAssignment> = None;
+    let mut assignments = Vec::new();
+    loop {
+        match reader.read_event().ok()? {
+            Event::Decl(declaration) => {
+                if roots != 0 || declared { return None; }
+                declared = true;
+                version = declaration.xml_version().ok()?;
+                if let Some(encoding) = declaration.encoding() {
+                    let encoding = encoding.ok()?;
+                    if !encoding.eq_ignore_ascii_case("utf-8") && !encoding.eq_ignore_ascii_case("us-ascii") { return None; }
+                }
+            }
+            Event::DocType(_) => return None,
+            Event::Start(element) => {
+                let name = element.name().into_inner().to_string();
+                let attributes = xml_attributes(&element, version)?;
+                if stack.is_empty() {
+                    roots += 1;
+                    if roots != 1 || name != "domain" { return None; }
+                }
+                if stack.iter().map(String::as_str).eq(["domain", "devices"])
+                    && name == "hostdev" && attributes.get("type").map(String::as_str) == Some("pci")
+                { current = Some(VmPciAssignment::default()); }
+                if let Some(assignment) = current.as_mut() {
+                    if name == "address" && stack.iter().map(String::as_str).eq(["domain", "devices", "hostdev", "source"]) {
+                        assignment.source_addresses += 1;
+                        assignment.host = pci_address_attributes(&attributes);
+                    } else if name == "address" && stack.iter().map(String::as_str).eq(["domain", "devices", "hostdev"]) {
+                        assignment.guest_addresses += 1;
+                        assignment.guest = (attributes.get("type").map(String::as_str) == Some("pci"))
+                            .then(|| pci_address_attributes(&attributes)).flatten();
+                    }
+                }
+                stack.push(name);
+            }
+            Event::End(element) => {
+                if stack.pop().as_deref() != Some(element.name().into_inner()) { return None; }
+                if element.name().into_inner() == "hostdev"
+                    && stack.iter().map(String::as_str).eq(["domain", "devices"])
+                {
+                    if let Some(assignment) = current.take() { assignments.push(assignment); }
+                }
+            }
+            Event::Text(text) => { if stack.is_empty() && !text.trim().is_empty() { return None; } }
+            Event::GeneralRef(reference) => {
+                let character = reference.resolve_char_ref().ok()?;
+                let predefined = matches!(&*reference, "amp" | "lt" | "gt" | "apos" | "quot");
+                if stack.is_empty() || (!predefined && character.is_none()) { return None; }
+            }
+            Event::CData(_) if stack.is_empty() => return None,
+            Event::Eof => break,
+            _ => (),
+        }
+    }
+    (roots == 1 && stack.is_empty()).then_some(assignments)
+}
+
+/// Assignment evidence uses only one direct hostdev/source PCI address.
+fn parse_gpu_passthrough_xml(xml: &str) -> Vec<String> {
+    parse_vm_hostdev_xml(xml).unwrap_or_default().into_iter().filter_map(|assignment| {
+        assignment.host.filter(|host| assignment.source_addresses == 1 && host.ends_with(".0"))
+    }).collect()
 }
 
 // TRACEWEAVER: entrypoint=parse_vm_gpu_mappings_xml; req=VM-FIX-002,VM-FIX-003; trace=TRACE-VM-002,TRACE-VM-003
 fn parse_vm_gpu_mappings_xml(xml: &str) -> Vec<(String, String)> {
-    // Keep the original address decisions until the shared semantic RED run.
-    parse_gpu_passthrough_xml(xml).into_iter().map(|address| (address.clone(), address)).collect()
-}
-
-/// Parse GPU passthrough from VM XML
-fn parse_gpu_passthrough_xml(xml: &str) -> Vec<String> {
-    let mut gpu_slots = Vec::new();
-
-    // Simple XML parsing - look for hostdev type="pci" entries
-    // Format: <address domain="0x0000" bus="0x01" slot="0x00" function="0x0"/>
-    
-    let mut in_hostdev = false;
-    let mut is_pci = false;
-
-    for line in xml.lines() {
-        let line = line.trim();
-        
-        if line.contains("<hostdev") && line.contains("type='pci'") {
-            in_hostdev = true;
-            is_pci = true;
-        } else if line.contains("</hostdev>") {
-            in_hostdev = false;
-            is_pci = false;
-        }
-        
-        if in_hostdev && is_pci && line.contains("<address") && line.contains("domain=") {
-            // Extract domain, bus, slot, function
-            if let Some(addr) = parse_pci_address(line) {
-                // Only add function 0 (the GPU itself, not audio)
-                if addr.ends_with(".0") {
-                    gpu_slots.push(addr);
-                }
-            }
-        }
+    let assignments = parse_vm_hostdev_xml(xml).unwrap_or_default();
+    let mut hosts = HashMap::<&str, usize>::new();
+    let mut guests = HashMap::<&str, usize>::new();
+    for assignment in &assignments {
+        if let Some(host) = &assignment.host { *hosts.entry(host.as_str()).or_default() += 1; }
+        if let Some(guest) = &assignment.guest { *guests.entry(guest.as_str()).or_default() += 1; }
     }
-
-    gpu_slots
+    assignments.iter().filter_map(|assignment| {
+        let host = assignment.host.as_ref()?;
+        let guest = assignment.guest.as_ref()?;
+        (assignment.source_addresses == 1 && assignment.guest_addresses == 1 && host.ends_with(".0")
+            && hosts.get(host.as_str()) == Some(&1) && guests.get(guest.as_str()) == Some(&1))
+            .then(|| (host.clone(), guest.clone()))
+    }).collect()
 }
 
-/// Parse PCI address from XML line
-fn parse_pci_address(line: &str) -> Option<String> {
-    let get_attr = |name: &str| -> Option<String> {
-        let pattern = format!("{}='", name);
-        let start = line.find(&pattern)? + pattern.len();
-        let end = line[start..].find('\'')?;
-        Some(line[start..start + end].to_string())
-    };
-
-    let domain = get_attr("domain")?.strip_prefix("0x").unwrap_or("0000").to_string();
-    let bus = get_attr("bus")?.strip_prefix("0x").unwrap_or("00").to_string();
-    let slot = get_attr("slot")?.strip_prefix("0x").unwrap_or("00").to_string();
-    let function = get_attr("function")?.strip_prefix("0x").unwrap_or("0").to_string();
-
-    Some(format!("{}:{}:{}.{}", domain, bus, slot, function))
+#[cfg(test)]
+fn parse_pci_address(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    match reader.read_event().ok()? {
+        Event::Empty(address) if address.name().into_inner() == "address" =>
+            pci_address_attributes(&xml_attributes(&address, XmlVersion::Implicit1_0)?),
+        _ => None,
+    }
 }
 
 /// Parse a metric value that might be "N/A" or "[N/A]"
@@ -619,7 +612,7 @@ mod tests {
             vm_definition_csv(1, "00000000:01:00.0", "GPU-A", 51),
             vm_definition_csv(7, "00000000:03:00.0", "GPU-UNMAPPED", 99)].join("\n");
         let mut calls = Vec::new();
-        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, false,
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &mappings, false,
             &mut |vm, command, args| {
                 calls.push((vm.to_string(), command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
                 Some((csv.clone(), 0))
@@ -644,7 +637,7 @@ mod tests {
         let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, 0x2204))]);
         let csv = [vm_definition_csv(0, "0000:01:00.0", "GPU-A", 51),
             vm_definition_csv(1, "00000000:01:00.0", "GPU-B", 99)].join("\n");
-        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, false,
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &mappings, false,
             &mut |_, _, _| Some((csv.clone(), 0)));
         assert!(rows.is_empty(), "conflicting guest rows must retain assignment-only status");
     }
@@ -678,7 +671,7 @@ mod tests {
             let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, device_id))]);
             let csv = vm_definition_csv(0, "00000000:01:00.0", "GPU-A", 51);
             let mut calls = Vec::new();
-            let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, enabled,
+            let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &mappings, enabled,
                 &mut |vm, command, args| {
                     calls.push((vm.to_string(), command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
                     if command == "/usr/bin/nvidia-smi" { Some((csv.clone(), 0)) }
@@ -699,7 +692,7 @@ mod tests {
         let mappings = HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 7, 0x2204))]);
         let csv = vm_definition_csv(0, "00000000:01:00.0", "GPU-A", 51);
         let mut calls = Vec::new();
-        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &[7, 3], &mappings, true,
+        let rows = VmMetricsCollector::get_vm_gpu_metrics_with("reserved-vm", &mappings, true,
             &mut |_, command, args| {
                 calls.push((command.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
                 if command == "/usr/bin/nvidia-smi" { Some((csv.clone(), 0)) }
@@ -711,6 +704,134 @@ mod tests {
         assert_eq!(rows[0].hotspot_temp, None);
         assert_eq!(calls.len(), 1, "device ID alone cannot establish a validated guest BAR profile");
         assert_eq!(calls[0].0, "/usr/bin/nvidia-smi");
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_definition_xml_rejects_dtd_encoding_and_non_direct_source_spoofs() {
+        let source = "<source><address domain='0x0000' bus='0xc1' slot='0x00' function='0x0'/></source>";
+        let domain = format!("<domain><devices><hostdev type='pci'>{source}</hostdev></devices></domain>");
+        for xml in [
+            format!("<!DOCTYPE domain SYSTEM 'https://invalid.example/domain.dtd'>{domain}"),
+            format!("<?xml version='1.0' encoding='UTF-16'?>{domain}"),
+            format!("<domain><metadata><hostdev type='pci'>{source}</hostdev></metadata></domain>"),
+            format!("<domain><devices><hostdev type='pci'><metadata>{source}</metadata></hostdev></devices></domain>"),
+            format!("{domain}{domain}"),
+            "<domain><devices><hostdev type='pci'><source><address domain='0x0000' bus='0xc1' bus='0x41' slot='0x00' function='0x0'/></source></hostdev></devices></domain>".into(),
+        ] {
+            assert!(parse_gpu_passthrough_xml(&xml).is_empty(), "{xml}");
+        }
+        assert_eq!(parse_gpu_passthrough_xml(&format!("<?xml version='1.0' encoding='UTF-8'?>{domain}")), vec!["0000:c1:00.0"]);
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_definition_cross_domain_host_assignment_does_not_choose_a_guest() {
+        let mut domains = vec![
+            ("guest-a".into(), vec!["0000:c1:00.0".into()], HashMap::from([("0000:01:00.0".into(), ("0000:c1:00.0".into(), 0, 0x2204))])),
+            ("guest-b".into(), vec!["0000:c1:00.0".into(), "0000:41:00.0".into(), "0000:e3:00.0".into()], HashMap::from([
+                ("0000:02:00.0".into(), ("0000:c1:00.0".into(), 0, 0x2204)),
+                ("0000:03:00.0".into(), ("0000:41:00.0".into(), 1, 0x2204)),
+                ("0000:04:00.0".into(), ("0000:e3:00.0".into(), 2, 0x2204)),
+            ])),
+            ("source-only-guest".into(), vec!["0000:e3:00.0".into()], HashMap::new()),
+        ];
+        retain_unique_vm_assignments(&mut domains);
+        assert!(domains[0].2.is_empty());
+        assert_eq!(domains[1].2.len(), 1);
+        assert_eq!(domains[1].2["0000:03:00.0"].0, "0000:41:00.0");
+        assert!(domains[2].2.is_empty());
+    }
+
+    fn vm_review_xml_address(bus: &str, target: bool) -> String {
+        format!("<address {}domain='0x0000' bus='0x{bus}' slot='0x00' function='0x0'/>",
+            if target { "type='pci' " } else { "" })
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_review_duplicate_guest_target_cannot_erase_another_host_conflict() {
+        let valid = format!("<hostdev type='pci'><source>{}</source>{}</hostdev>",
+            vm_review_xml_address("c1", false), vm_review_xml_address("01", true));
+        for targets in [["01", "02"], ["02", "01"]] {
+            let malformed = format!("<hostdev type='pci'><source>{}</source>{}{}</hostdev>",
+                vm_review_xml_address("41", false), vm_review_xml_address(targets[0], true), vm_review_xml_address(targets[1], true));
+            let xml = format!("<domain><devices>{valid}{malformed}</devices></domain>");
+            assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{targets:?}: {xml}");
+            assert_eq!(parse_gpu_passthrough_xml(&xml), vec!["0000:c1:00.0", "0000:41:00.0"]);
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_review_duplicate_host_source_cannot_erase_another_mapping_conflict() {
+        let valid = format!("<hostdev type='pci'><source>{}</source>{}</hostdev>",
+            vm_review_xml_address("c1", false), vm_review_xml_address("01", true));
+        for sources in [["c1", "41"], ["41", "c1"]] {
+            let malformed = format!("<hostdev type='pci'><source>{}{}</source>{}</hostdev>",
+                vm_review_xml_address(sources[0], false), vm_review_xml_address(sources[1], false), vm_review_xml_address("02", true));
+            let xml = format!("<domain><devices>{valid}{malformed}</devices></domain>");
+            assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{sources:?}: {xml}");
+        }
+        let source_only = format!("<domain><devices><hostdev type='pci'><source>{}</source></hostdev><hostdev type='pci'><source>{}</source></hostdev></devices></domain>",
+            vm_review_xml_address("c1", false), vm_review_xml_address("41", false));
+        assert_eq!(parse_gpu_passthrough_xml(&source_only), vec!["0000:c1:00.0", "0000:41:00.0"]);
+        assert!(parse_vm_gpu_mappings_xml(&source_only).is_empty());
+    }
+
+    fn vm_review_valid_xml_domain(metadata: &str) -> String {
+        format!("<domain>{metadata}<devices><hostdev type='pci'><source>{}</source>{}</hostdev></devices></domain>",
+            vm_review_xml_address("c1", false), vm_review_xml_address("01", true))
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_review_xml_declaration_must_precede_whitespace_comment_or_pi() {
+        // XML1.0 productions [22] prolog and [23] XMLDecl: declaration precedes Misc.
+        let declaration = "<?xml version='1.0' encoding='UTF-8'?>";
+        let domain = vm_review_valid_xml_domain("");
+        for prefix in [" ", "\n", "<!-- before declaration -->", "<?fixture before?>"] {
+            let xml = format!("{prefix}{declaration}{domain}");
+            assert!(parse_gpu_passthrough_xml(&xml).is_empty(), "{xml:?}");
+            assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{xml:?}");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_review_xml_illegal_literal_characters_reject_entire_document() {
+        // XML1.0 production [2] Char excludes these code points everywhere.
+        for character in ['\u{0}', '\u{1}', '\u{b}', '\u{c}', '\u{1f}', '\u{fffe}', '\u{ffff}'] {
+            for metadata in [format!("<name>{character}</name>"), format!("<metadata label='{character}'/>")] {
+                let xml = format!("<?xml version='1.0'?>{}", vm_review_valid_xml_domain(&metadata));
+                assert!(parse_gpu_passthrough_xml(&xml).is_empty(), "{xml:?}");
+                assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{xml:?}");
+            }
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_review_xml_illegal_numeric_references_reject_entire_document() {
+        // XML1.0 section4.1 Legal Character constraint also applies to references.
+        for reference in ["&#0;", "&#x1;", "&#xB;", "&#x1F;", "&#xFFFE;", "&#xFFFF;"] {
+            for metadata in [format!("<name>{reference}</name>"), format!("<metadata label='{reference}'/>")] {
+                let xml = format!("<?xml version='1.0'?>{}", vm_review_valid_xml_domain(&metadata));
+                assert!(parse_gpu_passthrough_xml(&xml).is_empty(), "{xml:?}");
+                assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{xml:?}");
+            }
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_review_valid_utf8_bom_declaration_and_legal_characters_remain_supported() {
+        let domain = vm_review_valid_xml_domain("<name>é😀\t\n\r&#x9;&#xA;&#xD;&#x20;&#x10000;&amp;</name>");
+        for prefix in ["", "\u{feff}", "<?xml version='1.0' encoding='UTF-8'?>", "\u{feff}<?xml version='1.0' encoding='UTF-8'?>"] {
+            let xml = format!("{prefix}{domain}");
+            assert_eq!(parse_gpu_passthrough_xml(&xml), vec!["0000:c1:00.0"], "{xml:?}");
+            assert_eq!(parse_vm_gpu_mappings_xml(&xml), vec![("0000:c1:00.0".into(), "0000:01:00.0".into())], "{xml:?}");
+        }
     }
 
     // HELD future case, not an executable expectation: a separately hardware-qualified

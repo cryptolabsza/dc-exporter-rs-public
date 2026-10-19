@@ -34,4 +34,12 @@ Existing scalar names and labels remain intact, including the established zero f
 
 Development publication retains version `0.2.7` and default `legacy`. Stable main/tag/release promotion waits for accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
 
+## VM register-policy correction candidate
+
+The source candidate's direct-register policy includes guest-agent commands: `--no-register-access` must suppress guest BAR reads as well as host BAR reads. Host legacy BAR requests require reconciled identity, current NVIDIA binding and no passthrough reservation or assignment, including inconsistent snapshots where NVML returns nominal data. Existing RUSD identity/binding gates remain in force. The flag preserves independently supplied valid mapped guest telemetry; host NVML/RUSD eligibility excludes guest GPUs. `off` remains the explicit global VRAM suppression.
+
+Guest register eligibility is separate from host thermal compatibility. The validated guest BAR profile set is empty, so guest BAR reads remain disabled with either flag setting. A future profile requires the exact guest PCI device, architecture, driver/environment, permitted register mechanism and offsets, and validation evidence. A model-name substring or host RUSD profile cannot establish guest eligibility. No new guest RUSD backend or RTX5090/Ada guest-memory support is claimed. Supplied valid guest temperature fixtures preserve their values and provenance only after unambiguous guest-to-host BDF mapping; unsupported or missing sensors remain unavailable.
+
+Operational acceptance remains **HELD** under the [bounded VM procedure](validation/vm-passthrough-acceptance.md). This document supplies no software/build or live pass result. Package `0.2.7`, default `legacy`, metric/status contracts, TUI and CryptoLabs branding remain the preservation contract.
+
 Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; devversion0.2.7 and defaultlegacy are preserved.

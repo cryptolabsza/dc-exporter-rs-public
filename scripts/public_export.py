@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 
 
 # Literal selection: adding a public path requires review of this policy and approval.
@@ -20,6 +21,7 @@ PUBLIC_PATHS = frozenset("""
 RELEASING.md TESTING.md build.rs config.toml.example
 docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md docs/gpu-health.md
 docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
+docs/validation/vm-passthrough-acceptance.md
 scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
 scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
 scripts/ci/rusd_abi.py scripts/ci/rusd-headers.json
@@ -45,6 +47,8 @@ REVIEWED_CHANGE_PATHS = frozenset({
     ".github/workflows/build.yml", ".gitignore", "Cargo.lock", "LICENSE", "README.md", "RELEASING.md", "TESTING.md",
     "docs/gpu-thermal-abi.md", "docs/gpu-thermal-support.md", "docs/public-publishing.md", "docs/gpu-health.md",
     "docs/validation/rtx5090-acceptance.md", "docs/fixtures/rusd-abi-layout.c",
+    "docs/validation/vm-passthrough-acceptance.md",
+    "src/metrics/collector.rs", "src/metrics/vm.rs", "src/metrics/pci.rs",
     "scripts/public_export.py", "scripts/ci/build_contract.py", "scripts/ci/build.sh",
     "scripts/ci/publish.py", "tests/release_workflow.rs", "tests/test_public_export.py",
     "scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json", "tests/test_ci_rusd_abi.py",
@@ -151,6 +155,24 @@ def repository_url_only(before, after):
             and b'repository = "https://github.com/cryptolabsza/dc-exporter-rs-public"' in after)
 
 
+def pinned_vm_dependency_only(before, after):
+    # Closed VM-FIX-006 exception: only this reviewed dependency block may be
+    # added. Every other byte still obeys the existing repository-URL rule.
+    addition = (b'\n# Strict libvirt XML parsing; encoding/transcoding and entity resolvers disabled.\n'
+                b'quick-xml = { version = "=0.42.0", default-features = false }\n')
+    if after.count(addition) != 1:
+        return False
+    try:
+        old = tomllib.loads(before.decode('utf-8'))
+        new = tomllib.loads(after.decode('utf-8'))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    return ('quick-xml' not in old.get('dependencies', {})
+            and new.get('dependencies', {}).get('quick-xml') == {
+                'version': '=0.42.0', 'default-features': False}
+            and repository_url_only(before, after.replace(addition, b'', 1)))
+
+
 def approved_blobs(repo, commit, approval):
     validate_approval(approval)
     commit_id(repo, commit)
@@ -183,8 +205,10 @@ def approved_blobs(repo, commit, approval):
                 raise ExportError("Unapproved changed bytes or mode: " + path)
             if path == "Cargo.toml":
                 before = git(repo, "cat-file", "blob", baseline[path][2]) if path in baseline else b""
-                if mode != baseline[path][0] or not repository_url_only(before, data):
-                    raise ExportError("Cargo approval permits only the public repository URL")
+                if (path not in baseline or mode != baseline[path][0]
+                        or not (repository_url_only(before, data)
+                                or pinned_vm_dependency_only(before, data))):
+                    raise ExportError("Cargo approval permits only the public repository URL and exact pinned VM parser addition")
             if path == "scripts/deploy.sh":
                 before = git(repo, "cat-file", "blob", baseline[path][2]) if path in baseline else b""
                 old_example = ("root@" + "192.168." + "1.100").encode()

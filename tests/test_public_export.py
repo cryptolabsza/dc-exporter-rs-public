@@ -122,8 +122,50 @@ tests/test_ci_build.py tests/test_ci_publisher.py
                       "scripts/ci/pool_manifest.py", "scripts/ci/notice_inventory.py",
                       "tests/test_pool_workflow.py", "tests/test_ci_notices.py",
                       "CONTRIBUTING.md", "SECURITY.md", "THIRD-PARTY-NOTICES.md"}
-        self.assertEqual(self.exporter.PUBLIC_PATHS, baseline | added | pool_paths | {"docs/gpu-health.md"})
+        self.assertEqual(self.exporter.PUBLIC_PATHS, baseline | added | pool_paths | {
+            "docs/gpu-health.md", "docs/validation/vm-passthrough-acceptance.md"})
         self.assertTrue(added.issubset(self.exporter.REVIEWED_CHANGE_PATHS))
+
+    def test_vm_exact_document_and_three_runtime_paths_require_reviewed_hashes(self):
+        paths = {"docs/validation/vm-passthrough-acceptance.md": "# VM acceptance definition\nOperational acceptance HELD; fixture only.\n",
+                 "src/metrics/collector.rs": "// reviewed collector fixture\n",
+                 "src/metrics/vm.rs": "// reviewed guest mapping fixture\n",
+                 "src/metrics/pci.rs": "// reviewed assignment evidence fixture\n"}
+        for path, content in paths.items():
+            with self.subTest(policy_path=path):
+                self.assertIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.put(path, content)
+        commit = self.commit()
+        approval = self.approve(commit, {path: "Reviewed exact VM correction fixture" for path in paths})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        for path in paths:
+            with self.subTest(path=path):
+                missing_reason = copy.deepcopy(approval)
+                del missing_reason["changes"][path]
+                self.rejected(lambda: self.export(commit, missing_reason))
+                empty_reason = copy.deepcopy(approval)
+                empty_reason["changes"][path] = " "
+                self.rejected(lambda: self.export(commit, empty_reason))
+                missing_hash = copy.deepcopy(approval)
+                del missing_hash["files"][path]["sha256"]
+                self.rejected(lambda: self.export(commit, missing_hash))
+                wrong_hash = copy.deepcopy(approval)
+                wrong_hash["files"][path]["sha256"] = "0" * 64
+                self.rejected(lambda: self.export(commit, wrong_hash))
+        self.export(commit, approval)
+        for path in paths:
+            self.assertEqual((self.output / path).read_bytes(), self.git("show", commit + ":" + path))
+
+    def test_vm_review_cannot_admit_unrelated_new_public_paths(self):
+        for path in ("docs/validation/vm-private.md", "src/metrics/vm_extra.rs"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+                self.put(path, "// unrelated fixture\n")
+                commit = self.commit()
+                self.rejected(lambda: self.export(commit, self.approve(commit, {path: "Reviewed reason cannot expand policy"})))
+                self.git("reset", "--hard", self.baseline)
 
     def test_driver_free_abi_files_require_reviewed_hashes_and_export_exactly(self):
         added = {"scripts/ci/rusd_abi.py": "# pinned public ABI helper fixture\n",
@@ -253,6 +295,61 @@ tests/test_ci_build.py tests/test_ci_publisher.py
         self.put("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.2.8"\nrepository = "https://github.com/cryptolabsza/dc-exporter-rs-public"\n')
         commit = self.commit()
         self.rejected(lambda: self.export(commit, self.approve(commit, {"Cargo.toml": "public repository URL"})))
+
+    def vm_cargo_manifests(self):
+        # Exercise the maintained real manifest's exact reviewed dependency block.
+        # These scratch exports provide no Cargo build or dependency-licence proof.
+        after = (SCRIPT.parent.parent / "Cargo.toml").read_text()
+        addition = '\n# Strict libvirt XML parsing; encoding/transcoding and entity resolvers disabled.\nquick-xml = { version = "=0.42.0", default-features = false }\n'
+        self.assertEqual(after.count(addition), 1)
+        return after.replace(addition, "", 1), after
+
+    def test_cargo_exact_vm_parser_addition_requires_reviewed_reason_and_hash(self):
+        before, after = self.vm_cargo_manifests()
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        self.put("Cargo.toml", after)
+        commit = self.commit()
+        approval = self.approve(commit, {"Cargo.toml": "Reviewed pinned VM XML parser addition"})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        for field, value in [("sha256", "0" * 64), ("mode", "100755")]:
+            wrong = copy.deepcopy(approval)
+            wrong["files"]["Cargo.toml"][field] = value
+            self.rejected(lambda: self.export(commit, wrong))
+        self.export(commit, approval)
+        self.assertEqual((self.output / "Cargo.toml").read_text(), after)
+
+    def test_cargo_vm_addition_can_accompany_existing_repository_url_sanitization(self):
+        before, after = self.vm_cargo_manifests()
+        before = before.replace('repository = "https://github.com/cryptolabsza/dc-exporter-rs-public"',
+                                'repository = "https://github.com/example/private-fixture"')
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        self.put("Cargo.toml", after)
+        commit = self.commit()
+        self.export(commit, self.approve(commit, {"Cargo.toml": "Reviewed exact parser and public repository URL"}))
+        self.assertEqual((self.output / "Cargo.toml").read_text(), after)
+
+    def test_cargo_vm_exception_rejects_every_other_manifest_change(self):
+        before, after = self.vm_cargo_manifests()
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        cases = [after.replace('version = "0.2.7"', 'version = "0.2.8"', 1),
+                 after.replace('"=0.42.0"', '"=0.42.1"'),
+                 after.replace('default-features = false', 'default-features = true'),
+                 after.replace('default-features = false', 'default-features = false, features = ["encoding"]'),
+                 after.replace('quick-xml = ', 'arbitrary-parser = '),
+                 after.replace('serde_json = "1"', 'serde_json = "2"'),
+                 after.replace('lto = true', 'lto = false'),
+                 after.replace('strip = true', 'strip = false'),
+                 after + '\n[features]\ndefault = ["unexpected"]\n',
+                 after.replace('version = "=0.42.0"', 'version = "=0.42.0", optional = true')]
+        for index, changed in enumerate(cases):
+            with self.subTest(case=index):
+                self.put("Cargo.toml", changed)
+                commit = self.commit()
+                self.rejected(lambda: self.export(commit, self.approve(commit, {"Cargo.toml": "A reason cannot expand exact parser policy"})))
+                self.git("reset", "--hard", self.baseline)
 
     def test_rejects_approved_hash_or_mode_mismatch(self):
         for field, value in (("sha256", "0" * 64), ("mode", "100755")):
