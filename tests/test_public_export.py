@@ -123,7 +123,9 @@ tests/test_ci_build.py tests/test_ci_publisher.py
                       "tests/test_pool_workflow.py", "tests/test_ci_notices.py",
                       "CONTRIBUTING.md", "SECURITY.md", "THIRD-PARTY-NOTICES.md"}
         self.assertEqual(self.exporter.PUBLIC_PATHS, baseline | added | pool_paths | {
-            "docs/gpu-health.md", "docs/validation/vm-passthrough-acceptance.md"})
+            "docs/gpu-health.md", "docs/validation/vm-passthrough-acceptance.md",
+            "docs/screenshots/rtx-5090-memory-temperatures.png",
+            "docs/screenshots/rtx-5000-ada-memory-temperatures.png"})
         self.assertTrue(added.issubset(self.exporter.REVIEWED_CHANGE_PATHS))
 
     def test_vm_exact_document_and_three_runtime_paths_require_reviewed_hashes(self):
@@ -156,6 +158,99 @@ tests/test_ci_build.py tests/test_ci_publisher.py
         self.export(commit, approval)
         for path in paths:
             self.assertEqual((self.output / path).read_bytes(), self.git("show", commit + ":" + path))
+
+    def test_formatter_is_the_exact_fourth_runtime_change_exception(self):
+        expected = {"src/metrics/collector.rs", "src/metrics/vm.rs",
+                    "src/metrics/pci.rs", "src/metrics/prometheus.rs"}
+        self.put("src/metrics/prometheus.rs", "// exact reviewed formatter correction\n")
+        commit = self.commit()
+        approval = self.approve(commit, {"src/metrics/prometheus.rs": "Reviewed VM fault formatter"})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        wrong = copy.deepcopy(approval)
+        wrong["files"]["src/metrics/prometheus.rs"]["sha256"] = "0" * 64
+        self.rejected(lambda: self.export(commit, wrong))
+        self.export(commit, approval)
+        self.assertEqual({path for path in self.exporter.REVIEWED_CHANGE_PATHS
+                          if path.startswith("src/")}, expected)
+        self.assertEqual((self.output / "src/metrics/prometheus.rs").read_bytes(),
+                         self.git("show", commit + ":src/metrics/prometheus.rs"))
+
+    def screenshot_fixture(self):
+        expected = {
+            "docs/screenshots/rtx-5090-memory-temperatures.png":
+                "88dfe48021c2030b6dda7fdf2f391825ee8e3f5af10e2cd1581dd9b8b22e4c40",
+            "docs/screenshots/rtx-5000-ada-memory-temperatures.png":
+                "dd555bede41bde4ca8392b01de02ed8621a6fba0ededbdfc5d0c3b34793e24f4",
+        }
+        for path, sha in expected.items():
+            data = (SCRIPT.parents[1] / path).read_bytes()
+            self.assertEqual(digest(data), sha)
+            self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o644)
+        commit = self.commit()
+        approval = self.approve(commit, {path: "Reviewed redacted deployed 0.2.7 TUI capture"
+                                         for path in expected})
+        return expected, commit, approval
+
+    def test_exact_reviewed_pngs_export_real_immutable_bytes_and_modes(self):
+        expected, commit, approval = self.screenshot_fixture()
+        # Mutable working-tree bytes must not replace the approved Git blobs.
+        for path in expected:
+            (self.repo / path).write_bytes(b"unapproved mutable image")
+        manifest = self.export(commit, approval)
+        for path, sha in expected.items():
+            self.assertIn(path, self.exporter.PUBLIC_PATHS)
+            self.assertIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.assertEqual(digest((self.output / path).read_bytes()), sha)
+            self.assertEqual((self.output / path).read_bytes(), self.git("show", commit + ":" + path))
+            self.assertEqual((self.output / path).stat().st_mode & 0o777, 0o644)
+            self.assertEqual(manifest["files"][path], {"sha256": sha, "mode": "100644"})
+
+    def test_reviewed_pngs_reject_wrong_hash_mode_missing_or_empty_reason(self):
+        expected, commit, approval = self.screenshot_fixture()
+        for path in expected:
+            with self.subTest(path=path):
+                for field, value in (("sha256", "0" * 64), ("mode", "100755")):
+                    wrong = copy.deepcopy(approval)
+                    wrong["files"][path][field] = value
+                    self.rejected(lambda: self.export(commit, wrong))
+                missing = copy.deepcopy(approval)
+                del missing["changes"][path]
+                self.rejected(lambda: self.export(commit, missing))
+                empty = copy.deepcopy(approval)
+                empty["changes"][path] = " "
+                self.rejected(lambda: self.export(commit, empty))
+
+    def test_reviewed_pngs_still_reject_private_content_with_matching_hash(self):
+        expected, _, _ = self.screenshot_fixture()
+        for path in expected:
+            with self.subTest(path=path):
+                target = self.repo / path
+                target.write_bytes(target.read_bytes() + b"/Us" + b"ers/private-operator")
+                commit = self.commit()
+                approval = self.approve(commit, {name: "Reviewed path does not bypass content checks"
+                                                 for name in expected})
+                self.rejected(lambda: self.export(commit, approval))
+                self.git("reset", "--hard", self.baseline)
+                self.screenshot_fixture()
+
+    def test_screenshot_selection_excludes_unknown_third_ada_and_private_paths(self):
+        for path in ("docs/screenshots/unknown.png", "docs/screenshots/rtx-6000-ada-memory-temperatures.png",
+                     ".traceweaver/screenshots/rtx-5090-memory-temperatures.png"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+                self.put(path, "unreviewed image fixture\n")
+                commit = self.commit()
+                approval = self.approve(commit)
+                approval["files"][path] = {"sha256": digest(self.git("show", commit + ":" + path)),
+                                           "mode": "100644"}
+                approval["changes"][path] = "A reason cannot expand literal selection"
+                self.rejected(lambda: self.export(commit, approval))
+                self.git("reset", "--hard", self.baseline)
 
     def test_vm_review_cannot_admit_unrelated_new_public_paths(self):
         for path in ("docs/validation/vm-private.md", "src/metrics/vm_extra.rs"):

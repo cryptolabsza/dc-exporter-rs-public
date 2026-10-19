@@ -28,6 +28,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
+## Historical project and register research credits
+
+DC Exporter began as a Rust refactor of the original CryptoLabs C exporter.
+The original project documentation also credits
+[olealgoritme/gddr6](https://github.com/olealgoritme/gddr6) for register-offset
+research. This research acknowledgment does not establish that upstream code
+was copied or that a licence grant applies to it.
+
 ## Adapted NVIDIA and Philip Langdale definitions
 
 The RUSD ABI definitions and driver-control sequence use public sources pinned in

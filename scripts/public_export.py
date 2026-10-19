@@ -22,6 +22,7 @@ RELEASING.md TESTING.md build.rs config.toml.example
 docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md docs/gpu-health.md
 docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
 docs/validation/vm-passthrough-acceptance.md
+docs/screenshots/rtx-5090-memory-temperatures.png docs/screenshots/rtx-5000-ada-memory-temperatures.png
 scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
 scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
 scripts/ci/rusd_abi.py scripts/ci/rusd-headers.json
@@ -48,7 +49,8 @@ REVIEWED_CHANGE_PATHS = frozenset({
     "docs/gpu-thermal-abi.md", "docs/gpu-thermal-support.md", "docs/public-publishing.md", "docs/gpu-health.md",
     "docs/validation/rtx5090-acceptance.md", "docs/fixtures/rusd-abi-layout.c",
     "docs/validation/vm-passthrough-acceptance.md",
-    "src/metrics/collector.rs", "src/metrics/vm.rs", "src/metrics/pci.rs",
+    "docs/screenshots/rtx-5090-memory-temperatures.png", "docs/screenshots/rtx-5000-ada-memory-temperatures.png",
+    "src/metrics/collector.rs", "src/metrics/vm.rs", "src/metrics/pci.rs", "src/metrics/prometheus.rs",
     "scripts/public_export.py", "scripts/ci/build_contract.py", "scripts/ci/build.sh",
     "scripts/ci/publish.py", "tests/release_workflow.rs", "tests/test_public_export.py",
     "scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json", "tests/test_ci_rusd_abi.py",

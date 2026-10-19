@@ -155,7 +155,8 @@ class PublicPoolExportTests(unittest.TestCase):
         added = {'.github/workflows/ci-pool-build-recipe.yml', 'scripts/ci/pool-build.sh', 'scripts/ci/pool_manifest.py', 'scripts/ci/notice_inventory.py', 'tests/test_pool_workflow.py', 'tests/test_ci_notices.py', 'CONTRIBUTING.md', 'SECURITY.md', 'THIRD-PARTY-NOTICES.md'}
         self.assertTrue(added <= exporter.PUBLIC_PATHS, sorted(added - exporter.PUBLIC_PATHS))
         self.assertTrue(added <= exporter.REVIEWED_CHANGE_PATHS)
-        vm_runtime_exceptions = {'src/metrics/collector.rs', 'src/metrics/vm.rs', 'src/metrics/pci.rs'}
+        vm_runtime_exceptions = {'src/metrics/collector.rs', 'src/metrics/vm.rs', 'src/metrics/pci.rs',
+                                 'src/metrics/prometheus.rs'}
         self.assertEqual({path for path in exporter.REVIEWED_CHANGE_PATHS if path.startswith('src/')},
                          vm_runtime_exceptions)
         for path in ('src/main.rs', 'src/state.rs', 'src/metrics/thermal.rs',
