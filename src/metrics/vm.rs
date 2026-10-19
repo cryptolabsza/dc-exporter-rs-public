@@ -111,7 +111,11 @@ impl VmMetricsCollector {
         let Ok(output) = Command::new("virsh").args(["dumpxml", vm_name]).output() else { return (Vec::new(), Vec::new()); };
         if !output.status.success() { return (Vec::new(), Vec::new()); }
         let Ok(xml) = std::str::from_utf8(&output.stdout) else { return (Vec::new(), Vec::new()); };
-        (parse_gpu_passthrough_xml(xml), parse_vm_gpu_mappings_xml(xml))
+        // Candidate identities are conservative conflict-denial inputs only.
+        // Positive assignment discovery still requires one unambiguous source.
+        let candidates = parse_vm_hostdev_xml(xml).unwrap_or_default().into_iter()
+            .flat_map(|assignment| assignment.source_candidates).collect();
+        (candidates, parse_vm_gpu_mappings_xml(xml))
     }
 
     /// Execute command inside VM via QEMU guest agent
@@ -370,6 +374,7 @@ fn retain_unique_vm_assignments(domains: &mut [VmGpuDomain]) {
 struct VmPciAssignment {
     host: Option<String>,
     guest: Option<String>,
+    source_candidates: Vec<String>,
     source_addresses: usize,
     guest_addresses: usize,
 }
@@ -380,6 +385,7 @@ fn xml_attributes(element: &BytesStart<'_>, version: XmlVersion) -> Option<HashM
         let attribute = attribute.ok()?;
         let key = attribute.key.into_inner().to_string();
         let value = attribute.normalized_value(version).ok()?.into_owned();
+        if !value.chars().all(is_xml10_character) { return None; }
         if attributes.insert(key, value).is_some() { return None; }
     }
     Some(attributes)
@@ -398,24 +404,33 @@ fn pci_address_attributes(attributes: &HashMap<String, String>) -> Option<String
 
 // TRACEWEAVER: entrypoint=parse_vm_hostdev_xml; req=VM-FIX-002,VM-FIX-003; trace=TRACE-VM-002,TRACE-VM-003
 fn parse_vm_hostdev_xml(xml: &str) -> Option<Vec<VmPciAssignment>> {
+    let original_is_ascii = xml.is_ascii();
+    if !xml.chars().all(is_xml10_character) { return None; }
+    let xml = xml.strip_prefix('\u{feff}').unwrap_or(xml);
     let mut reader = Reader::from_str(xml);
     reader.config_mut().enable_all_checks(true);
     reader.config_mut().expand_empty_elements = true;
     let mut stack = Vec::<String>::new();
     let mut roots = 0;
     let mut declared = false;
+    let mut declaration_allowed = true;
     let mut version = XmlVersion::Implicit1_0;
     let mut current: Option<VmPciAssignment> = None;
     let mut assignments = Vec::new();
     loop {
-        match reader.read_event().ok()? {
+        let event = reader.read_event().ok()?;
+        if matches!(&event, Event::Decl(_)) && !declaration_allowed { return None; }
+        declaration_allowed = false;
+        match event {
             Event::Decl(declaration) => {
-                if roots != 0 || declared { return None; }
+                if roots != 0 || declared || !xml.starts_with("<?xml") { return None; }
                 declared = true;
                 version = declaration.xml_version().ok()?;
+                if version != XmlVersion::Explicit1_0 { return None; }
                 if let Some(encoding) = declaration.encoding() {
                     let encoding = encoding.ok()?;
                     if !encoding.eq_ignore_ascii_case("utf-8") && !encoding.eq_ignore_ascii_case("us-ascii") { return None; }
+                    if encoding.eq_ignore_ascii_case("us-ascii") && !original_is_ascii { return None; }
                 }
             }
             Event::DocType(_) => return None,
@@ -433,6 +448,7 @@ fn parse_vm_hostdev_xml(xml: &str) -> Option<Vec<VmPciAssignment>> {
                     if name == "address" && stack.iter().map(String::as_str).eq(["domain", "devices", "hostdev", "source"]) {
                         assignment.source_addresses += 1;
                         assignment.host = pci_address_attributes(&attributes);
+                        if let Some(host) = &assignment.host { assignment.source_candidates.push(host.clone()); }
                     } else if name == "address" && stack.iter().map(String::as_str).eq(["domain", "devices", "hostdev"]) {
                         assignment.guest_addresses += 1;
                         assignment.guest = (attributes.get("type").map(String::as_str) == Some("pci"))
@@ -454,6 +470,7 @@ fn parse_vm_hostdev_xml(xml: &str) -> Option<Vec<VmPciAssignment>> {
                 let character = reference.resolve_char_ref().ok()?;
                 let predefined = matches!(&*reference, "amp" | "lt" | "gt" | "apos" | "quot");
                 if stack.is_empty() || (!predefined && character.is_none()) { return None; }
+                if character.is_some_and(|character| !is_xml10_character(character)) { return None; }
             }
             Event::CData(_) if stack.is_empty() => return None,
             Event::Eof => break,
@@ -461,6 +478,12 @@ fn parse_vm_hostdev_xml(xml: &str) -> Option<Vec<VmPciAssignment>> {
         }
     }
     (roots == 1 && stack.is_empty()).then_some(assignments)
+}
+
+/// XML1.0 production [2] Char, applied to literals and resolved references.
+fn is_xml10_character(character: char) -> bool {
+    matches!(character as u32,
+        0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
 }
 
 /// Assignment evidence uses only one direct hostdev/source PCI address.
@@ -473,6 +496,11 @@ fn parse_gpu_passthrough_xml(xml: &str) -> Vec<String> {
 // TRACEWEAVER: entrypoint=parse_vm_gpu_mappings_xml; req=VM-FIX-002,VM-FIX-003; trace=TRACE-VM-002,TRACE-VM-003
 fn parse_vm_gpu_mappings_xml(xml: &str) -> Vec<(String, String)> {
     let assignments = parse_vm_hostdev_xml(xml).unwrap_or_default();
+    // A malformed hostdev must not erase a conflicting earlier identity and
+    // accidentally authorize another entry's guest telemetry.
+    if assignments.iter().any(|assignment| assignment.source_addresses > 1 || assignment.guest_addresses > 1) {
+        return Vec::new();
+    }
     let mut hosts = HashMap::<&str, usize>::new();
     let mut guests = HashMap::<&str, usize>::new();
     for assignment in &assignments {
@@ -831,6 +859,44 @@ mod tests {
             let xml = format!("{prefix}{domain}");
             assert_eq!(parse_gpu_passthrough_xml(&xml), vec!["0000:c1:00.0"], "{xml:?}");
             assert_eq!(parse_vm_gpu_mappings_xml(&xml), vec![("0000:c1:00.0".into(), "0000:01:00.0".into())], "{xml:?}");
+        }
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-003; req=VM-FIX-003; trace=TRACE-VM-003
+    #[test]
+    fn vm_review_duplicate_source_candidates_deny_other_domain_without_becoming_assignment_proof() {
+        let malformed = format!("<domain><devices><hostdev type='pci'><source>{}{}</source>{}</hostdev></devices></domain>",
+            vm_review_xml_address("c1", false), vm_review_xml_address("41", false), vm_review_xml_address("02", true));
+        assert!(parse_gpu_passthrough_xml(&malformed).is_empty());
+        assert!(parse_vm_gpu_mappings_xml(&malformed).is_empty());
+        let candidates = parse_vm_hostdev_xml(&malformed).unwrap().into_iter()
+            .flat_map(|assignment| assignment.source_candidates).collect();
+        let mut domains = vec![
+            ("valid-domain".into(), vec!["0000:c1:00.0".into()], HashMap::from([
+                ("0000:01:00.0".into(), ("0000:c1:00.0".into(), 0, 0x2204)),
+            ])),
+            ("malformed-domain".into(), candidates, HashMap::new()),
+        ];
+        retain_unique_vm_assignments(&mut domains);
+        assert!(domains[0].2.is_empty());
+        assert!(domains[1].2.is_empty());
+    }
+
+    // TRACEWEAVER: verifies=VER-VM-002; req=VM-FIX-002; trace=TRACE-VM-002
+    #[test]
+    fn vm_review_ascii_encoding_and_supported_xml_version_are_enforced() {
+        let ascii = vm_review_valid_xml_domain("<name>ASCII</name>");
+        assert_eq!(parse_gpu_passthrough_xml(&format!("<?xml version='1.0' encoding='US-ASCII'?>{ascii}")), vec!["0000:c1:00.0"]);
+        let unicode = vm_review_valid_xml_domain("<name>é</name>");
+        assert_eq!(parse_gpu_passthrough_xml(&format!("<?xml version='1.0' encoding='UTF-8'?>{unicode}")), vec!["0000:c1:00.0"]);
+        for xml in [
+            format!("<?xml version='1.0' encoding='US-ASCII'?>{unicode}"),
+            format!("\u{feff}<?xml version='1.0' encoding='US-ASCII'?>{ascii}"),
+            format!("<?xml version='1.1'?>{ascii}"),
+            format!("<?xml version='2.0'?>{ascii}"),
+        ] {
+            assert!(parse_gpu_passthrough_xml(&xml).is_empty(), "{xml:?}");
+            assert!(parse_vm_gpu_mappings_xml(&xml).is_empty(), "{xml:?}");
         }
     }
 

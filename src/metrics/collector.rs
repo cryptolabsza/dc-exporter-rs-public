@@ -615,6 +615,17 @@ fn merge_gpu_snapshot(
                 pci_index, vm_gpu.vram_temp, vm_gpu.hotspot_temp);
             let mut gpu = (**vm_gpu).clone();
             gpu.index = pci_index;
+            let active_reason = {
+                let mut tracker = evidence_tracker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                active_hardware_failure_reason(pci_gpu, dmesg_errors, &mut tracker)
+            };
+            if let Some(reason) = active_reason {
+                gpu.state = GpuState::HardwareFailure;
+                gpu.hardware_failure_reason = Some(reason);
+                clear_volatile_gpu_telemetry(&mut gpu);
+            }
             gpu
         } else if let Some(reason) = {
             let mut evidence_tracker = evidence_tracker
