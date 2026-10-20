@@ -107,7 +107,7 @@ RELEASING.md TESTING.md build.rs config.toml.example
 docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md
 docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
 scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
-scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
+scripts/ci/build_contract.py scripts/ci/build.sh
 src/config.rs src/main.rs src/safe_nvml.rs src/state.rs
 src/metrics/collector.rs src/metrics/dmesg.rs src/metrics/gpu.rs src/metrics/mod.rs
 src/metrics/nvidia_rm/abi.rs src/metrics/nvidia_rm/mod.rs src/metrics/nvidia_rm/rusd.rs
@@ -116,7 +116,7 @@ src/metrics/thermal.rs src/metrics/thermal_worker.rs src/metrics/vm.rs
 src/tui/app.rs src/tui/mod.rs src/tui/ui.rs systemd/dc-exporter.service
 tests/nvidia_rm_abi.rs tests/nvidia_rm_rusd.rs tests/release_workflow.rs
 tests/thermal_policy.rs tests/thermal_worker.rs tests/test_public_export.py
-tests/test_ci_build.py tests/test_ci_publisher.py
+tests/test_ci_build.py
 """.split())
         pool_paths = {".github/workflows/ci-pool-build-recipe.yml", "scripts/ci/pool-build.sh",
                       "scripts/ci/pool_manifest.py", "scripts/ci/notice_inventory.py",
@@ -127,6 +127,44 @@ tests/test_ci_build.py tests/test_ci_publisher.py
             "docs/screenshots/rtx-5090-memory-temperatures.png",
             "docs/screenshots/rtx-5000-ada-memory-temperatures.png"})
         self.assertTrue(added.issubset(self.exporter.REVIEWED_CHANGE_PATHS))
+
+    def test_current_source_has_exact_65_paths_and_no_retired_publisher_pair(self):
+        self.assertEqual(len(self.exporter.PUBLIC_PATHS), 65)
+        for path in ['scripts/ci/publish.py', 'tests/test_ci_publisher.py']:
+            self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+            self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.assertFalse((SCRIPT.parents[1] / path).exists())
+
+    def test_explicit_new_65_file_canonical_baseline_exports_exact_tree(self):
+        expected = self.exporter.PUBLIC_PATHS - {'scripts/ci/publish.py', 'tests/test_ci_publisher.py'}
+        self.assertEqual(len(expected), 65)
+        for path in expected:
+            source = SCRIPT.parents[1] / path
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.chmod(source.stat().st_mode & 0o777)
+        commit = self.commit()
+        approval = self.approve(commit)
+        approval['baseline_commit'] = commit  # Explicit reviewed new canonical baseline.
+        manifest = self.export(commit, approval)
+        self.assertEqual(set(manifest['files']), expected)
+        self.assertEqual(len(manifest['files']), 65)
+        self.assertEqual(manifest['baseline_commit'], commit)
+        self.assertFalse((self.output / 'scripts/ci/publish.py').exists())
+        self.assertFalse((self.output / 'tests/test_ci_publisher.py').exists())
+
+    def test_old_baseline_with_retired_test_is_still_rejected_by_unknown_test_guard(self):
+        self.put('scripts/ci/publish.py', '# obsolete fixture publisher\n')
+        self.put('tests/test_ci_publisher.py', '# obsolete fixture test\n')
+        old_baseline = self.commit()
+        (self.repo / 'scripts/ci/publish.py').unlink()
+        (self.repo / 'tests/test_ci_publisher.py').unlink()
+        current = self.commit()
+        approval = self.approve(current)
+        approval['baseline_commit'] = old_baseline
+        with self.assertRaisesRegex(self.exporter.ExportError, 'Unknown production/test path'):
+            self.export(current, approval)
 
     def test_vm_exact_document_and_three_runtime_paths_require_reviewed_hashes(self):
         paths = {"docs/validation/vm-passthrough-acceptance.md": "# VM acceptance definition\nOperational acceptance HELD; fixture only.\n",

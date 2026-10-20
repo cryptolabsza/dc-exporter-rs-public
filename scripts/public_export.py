@@ -24,7 +24,7 @@ docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
 docs/validation/vm-passthrough-acceptance.md
 docs/screenshots/rtx-5090-memory-temperatures.png docs/screenshots/rtx-5000-ada-memory-temperatures.png
 scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
-scripts/ci/build_contract.py scripts/ci/build.sh scripts/ci/publish.py
+scripts/ci/build_contract.py scripts/ci/build.sh
 scripts/ci/rusd_abi.py scripts/ci/rusd-headers.json
 src/config.rs src/main.rs src/safe_nvml.rs src/state.rs
 src/metrics/collector.rs src/metrics/dmesg.rs src/metrics/gpu.rs src/metrics/mod.rs
@@ -34,7 +34,7 @@ src/metrics/thermal.rs src/metrics/thermal_worker.rs src/metrics/vm.rs
 src/tui/app.rs src/tui/mod.rs src/tui/ui.rs systemd/dc-exporter.service
 tests/nvidia_rm_abi.rs tests/nvidia_rm_rusd.rs tests/release_workflow.rs
 tests/thermal_policy.rs tests/thermal_worker.rs tests/test_public_export.py
-tests/test_ci_build.py tests/test_ci_publisher.py
+tests/test_ci_build.py
 tests/test_ci_rusd_abi.py
 .github/workflows/ci-pool-build-recipe.yml scripts/ci/pool-build.sh scripts/ci/pool_manifest.py
 scripts/ci/notice_inventory.py tests/test_pool_workflow.py tests/test_ci_notices.py
@@ -52,9 +52,9 @@ REVIEWED_CHANGE_PATHS = frozenset({
     "docs/screenshots/rtx-5090-memory-temperatures.png", "docs/screenshots/rtx-5000-ada-memory-temperatures.png",
     "src/metrics/collector.rs", "src/metrics/vm.rs", "src/metrics/pci.rs", "src/metrics/prometheus.rs",
     "scripts/public_export.py", "scripts/ci/build_contract.py", "scripts/ci/build.sh",
-    "scripts/ci/publish.py", "tests/release_workflow.rs", "tests/test_public_export.py",
+    "tests/release_workflow.rs", "tests/test_public_export.py",
     "scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json", "tests/test_ci_rusd_abi.py",
-    "tests/test_ci_build.py", "tests/test_ci_publisher.py", "Cargo.toml", "scripts/deploy.sh",
+    "tests/test_ci_build.py", "Cargo.toml", "scripts/deploy.sh",
 })
 SCHEMA = "public-snapshot/1"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
