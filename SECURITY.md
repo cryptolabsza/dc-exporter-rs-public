@@ -30,9 +30,13 @@ and PR code must not execute on trusted runners or receive organization secrets.
 
 ---
 
-**Publication prerequisite:** GitHub
-private vulnerability reporting must be enabled and the reporting link above must
-be verified on the fresh source repository before this policy or the repository
-is made public. No reporting email address has been invented. Maintainers must
+**Publication prerequisite:** GitHub private vulnerability reporting is available
+for public repositories. Keep this repository private until the owner explicitly
+approves the reviewed visibility cutover. During that cutover, hold Actions and
+artifact publication, change visibility, enable private vulnerability reporting,
+and verify both its enabled status and the reporting form linked above before
+public launch or announcement. If enablement or verification fails, stop the
+launch and follow the approved visibility rollback; do not announce a working
+reporting channel. No reporting email address has been invented. Maintainers must
 also decide and document supported release lines; this policy promises no response
 time or historical-version security coverage.

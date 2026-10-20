@@ -73,10 +73,11 @@ key blocks in selected content. They complement a separately reviewed credential
 scan, exact public-tree review and Actions log/summary/artifact review. A passing
 marker or secret-pattern scan is not proof that all confidential content is absent.
 
-The legacy BAR register implementation remains byte-for-byte preserved. Its
-historical provenance and confidentiality are not established by the RUSD public
-source notices. Owner clearance of that legacy disclosure remains required before
-public visibility; the export helper must not silently remove production code.
+The legacy BAR register implementation remains byte-for-byte preserved. Hannes
+Zietsman confirmed that the original C-derived implementation is his work and may
+be published. Retain the active Rust backend and historical research credits;
+the export helper must not silently remove production code. Final disclosure
+review of the public tree, history, logs and artifacts remains separate.
 
 The project already declares MIT and identifies CryptoLabs ZA in Cargo metadata.
 `LICENSE` records that declared permission and author identity without inventing
@@ -131,7 +132,8 @@ rehearse without writing public assets during preparation.
 Actual admission denial checks, a source1416116330 shared run, independent artifact
 inspection, cleanup and tree/log/artifact disclosure review remain prerequisites
 for acceptance. Preserve the old private source/history and existing public
-release assets. Legacy BAR ownership/disclosure, verified private vulnerability
+release assets. The owner confirmation above covers the original C-derived BAR
+implementation; comprehensive disclosure review, verified private vulnerability
 reporting and final owner visibility/asset approval remain separate gates.
 Stable RTX5090 promotion requires accepted real-card qualification; software
 checks and limited observed readings cannot replace it. Rollback disables only

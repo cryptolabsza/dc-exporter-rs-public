@@ -95,10 +95,11 @@ files. Missing or unresolved selected licensing fails the build. The generated
 the complete dependency inventory of a binary. The separate build evidence records
 the target, command, resolved graph, selected package identities and file hashes.
 
-## Pending legacy provenance clearance
+## Legacy implementation provenance
 
-The historical legacy BAR implementation has a separate owner provenance and
-disclosure review. The public RUSD sources above do not establish ownership or
-redistribution clearance of every earlier contribution. Preserve the legacy code;
-record clearance of the exact proposed public bytes and add any applicable
-upstream notices before public visibility. No ownership or disclosure clearance is asserted here.
+The legacy BAR temperature implementation was ported from the original CryptoLabs
+C exporter. Hannes Zietsman confirmed that the original implementation is his work
+and may be published. The active Rust backend is retained for eligible GPU memory
+and hotspot readings. Historical research credits and third-party notices above
+remain applicable; this confirmation does not grant a licence to unrelated
+third-party code.
