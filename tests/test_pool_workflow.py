@@ -9,12 +9,14 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
 CONTRACT = json.loads(Path(os.environ['PUBLIC_ARTIFACT_CONTRACT']).read_text()) if os.environ.get('PUBLIC_ARTIFACT_CONTRACT') else {
     'source_repository': 'cryptolabsza/dc-exporter-rs-public', 'source_repository_id': 1416116330,
-    'fresh_archive_entries': ['dc-exporter-rs', 'dc-exporter-rs_amd64.deb', 'dc-exporter-rs_0.2.7_amd64.deb', 'BUILD_INFO.txt', 'VERSION.txt', 'HELP.txt', 'SYMBOLS.txt', 'THIRD-PARTY-NOTICES.md', 'SHA256SUMS', 'manifest.json'],
+    'fresh_archive_entries': ['dc-exporter-rs', 'dc-exporter-rs_amd64.deb', f'dc-exporter-rs_{PACKAGE["version"]}_amd64.deb', 'BUILD_INFO.txt', 'VERSION.txt', 'HELP.txt', 'SYMBOLS.txt', 'THIRD-PARTY-NOTICES.md', 'SHA256SUMS', 'manifest.json'],
     'limits': {'file': 134217728, 'total': 209715200}}
 
 
@@ -45,7 +47,7 @@ class PublicPoolManifestTests(unittest.TestCase):
         self.env = {'GITHUB_REPOSITORY': CONTRACT['source_repository'], 'GITHUB_REPOSITORY_ID': str(CONTRACT['source_repository_id']), 'GITHUB_SHA': 'a' * 40, 'GITHUB_REF': 'refs/heads/dev', 'GITHUB_RUN_ID': '17', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF_PROTECTED': 'true'}
         for name in CONTRACT['fresh_archive_entries']:
             if name not in {'manifest.json', 'SHA256SUMS'}:
-                (self.dist / name).write_bytes(b'dc-exporter 0.2.7\n' if name == 'VERSION.txt' else b'fixture bytes\n')
+                (self.dist / name).write_bytes(f'dc-exporter {PACKAGE["version"]}\n'.encode() if name == 'VERSION.txt' else b'fixture bytes\n')
         sums = ''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(self.dist.iterdir()))
         (self.dist / 'SHA256SUMS').write_text(sums)
 
@@ -167,7 +169,11 @@ class PublicPoolExportTests(unittest.TestCase):
         frozen = {'src/tui/app.rs': 'a105c80a8294205b73b0e562044c05337d81a4a679f4d2a63c30742fd8ae728e', 'src/tui/mod.rs': 'd29db51ead2a40eb7450acd3828a5cc5064fab0f8f137c4065826e07e9181175', 'src/tui/ui.rs': '29d863fdbb67e7524ee8d29716f53fff9edb704ea700e3d85a0b0e20bd421ff1'}
         for path, digest in frozen.items():
             self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(), digest, path)
-        self.assertIn('version = "0.2.7"', (ROOT / "Cargo.toml").read_text())
+        self.assertIn(PACKAGE["version"], {"0.2.7", "0.3.0"})
+        lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
+        roots = [p for p in lock["package"] if p["name"] == PACKAGE["name"] and "source" not in p]
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["version"], PACKAGE["version"])
 
 
 if __name__ == '__main__':

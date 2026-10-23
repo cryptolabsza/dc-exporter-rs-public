@@ -13,10 +13,11 @@ workloads.
 
 ## Quickstart
 
-This README describes the current development source; experimental RTX 5090
-telemetry and current recovery diagnostics require a matching development or
-source build. Historical stable **0.2.8** downloads retain older provenance and
-were not built from this source history.
+**v0.3.0** is the versioned release line for this source history. Use its published
+artifacts with `BUILD_INFO.txt` identifying the exact accepted protected-main
+commit and verify their checksums. RTX 5090 RUSD remains opt-in and experimental;
+full hardware and live VM acceptance remain pending. Historical stable **0.2.8**
+downloads retain older provenance and were not built from this source history.
 
 Download the Linux x86-64 executable `dc-exporter-rs` and matching checksums from
 [releases](https://github.com/cryptolabsza/dc-exporter-releases/releases).
@@ -218,15 +219,18 @@ remains pending; see the [VM acceptance procedure](docs/validation/vm-passthroug
 - [Stable downloads](https://github.com/cryptolabsza/dc-exporter-releases/releases)
 - [Development channel](https://github.com/cryptolabsza/dc-exporter-releases/releases/tag/dev-latest)
 
-The development tree is **0.2.7**. Historical stable **0.2.8** assets retain their
-original provenance and are not builds of this fresh source history. Identify a
-candidate by its source commit, artifact SHA-256 and `BUILD_INFO.txt`, rather than
-comparing those version strings alone.
+Development on `dev` retains **0.2.7**; the reviewed promotion to `main` carries
+**0.3.0**. Release publication requires an accepted protected-main build and source
+tag `v0.3.0` on that exact commit. Use the tag for the versioned source release
+and `dev` for development. Historical stable **0.2.8** assets retain their original
+provenance and are not builds of this fresh source history. Identify a candidate
+by its source commit, artifact SHA-256 and `BUILD_INFO.txt`.
 
-For a source build on Linux x86-64 with Rust 1.88.0 and a C toolchain:
+For a versioned source build on Linux x86-64 with Rust 1.88.0 and a C toolchain
+(use `--branch dev` for the development channel):
 
 ```sh
-git clone --branch dev https://github.com/cryptolabsza/dc-exporter-rs-public.git
+git clone --branch v0.3.0 https://github.com/cryptolabsza/dc-exporter-rs-public.git
 cd dc-exporter-rs-public
 cargo +1.88.0 build --release --locked
 ./target/release/dc-exporter --version

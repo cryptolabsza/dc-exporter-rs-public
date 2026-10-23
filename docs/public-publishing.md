@@ -32,10 +32,20 @@ files/directories are rejected.
 
 Every source/test/package byte and mode must equal the baseline, except the
 explicitly permitted documentation, CI, license and new export/test paths.
-Cargo changes are restricted to the public repository URL; the version remains
-0.2.7. Deployment-helper changes are restricted to example-identifier sanitization.
+The initial import contract restricts Cargo changes to the public repository URL
+and the separately reviewed exact VM parser dependency exception; its version
+remains 0.2.7. Deployment-helper changes are restricted to example-identifier sanitization.
 Each actual exception requires a separate reason; stale/extra reason entries fail.
 The helper does not grant approval merely by producing a candidate manifest.
+
+The owner-approved v0.3.0 software release is a subsequent reviewed public-source
+promotion, not a new import of private history. Its main promotion PR changes
+only the root Cargo manifest/lock package versions to `0.3.0`; `dev` retains
+`0.2.7`. This does not broaden the export helper's package-change permissions.
+Require an accepted protected-main build, source tag on that exact commit and
+verified publisher readback for versioned asset publication. RTX 5090 stays
+opt-in and experimental, default `legacy` is preserved,
+and full hardware and live VM acceptance remain held.
 
 Example operator sequence, with full reviewed commit SHAs and a reviewed external
 JSON reason map supplied through environment variables:

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -467,7 +468,11 @@ tests/test_ci_build.py
         before, after = self.vm_cargo_manifests()
         self.put("Cargo.toml", before)
         self.baseline = self.commit()
-        cases = [after.replace('version = "0.2.7"', 'version = "0.2.8"', 1),
+        version = tomllib.loads(after)["package"]["version"]
+        changed_version = "9999.0.0" if version != "9999.0.0" else "9999.0.1"
+        version_case = after.replace(f'version = "{version}"', f'version = "{changed_version}"', 1)
+        self.assertNotEqual(version_case, after, "package-version rejection fixture must change the manifest")
+        cases = [version_case,
                  after.replace('"=0.42.0"', '"=0.42.1"'),
                  after.replace('default-features = false', 'default-features = true'),
                  after.replace('default-features = false', 'default-features = false, features = ["encoding"]'),

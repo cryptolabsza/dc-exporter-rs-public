@@ -12,7 +12,7 @@ Inspect V2/V3/V5/V7/V9/V10 evidence and the compatibility record for pinned sour
 
 Expected private evidence root: `validation/rtx5090/<run-id>/` outside Git unless sharing is explicitly authorized. Each run records requirement/procedure/validation IDs, tested candidate, environment/configuration, expected/actual result, pass/fail/inconclusive, deviations and artifact locations. Never put secrets in records. Do not write an empty placeholder file and label it RED or hardware proof.
 
-All client/production hosts are excluded from this execution plan. No SSH, new probes, workload changes, driver controls or reboot are authorized by this definition. In particular do not repeat the blocked sysfs `driver_override` read. No stable RTX 5090 main/tag/release promotion until actual evidence is accepted; the owner controls that decision and publication. Experimental source visibility requires the separate public-tree/CI disclosure gates.
+All client/production hosts are excluded from this execution plan. No SSH, new probes, workload changes, driver controls or reboot are authorized by this definition. In particular do not repeat the blocked sysfs `driver_override` read. No promotion of RTX 5090 support to hardware-qualified status until actual evidence is accepted; the owner controls that decision and publication. The later owner-approved v0.3.0 software release may include opt-in experimental RTX 5090 support with full hardware acceptance still pending. Require an accepted protected-main build, a tag on that exact commit and verified publisher readback for the versioned software release; this definition supplies no release-completion evidence. Experimental source visibility requires the separate public-tree/CI disclosure gates.
 
 ## Bounded evidence as of 2026-10-13
 
@@ -50,7 +50,7 @@ controls, workload tests, reboot or OS switching require explicit lab authorizat
 Retain the V1/V8/V10 identifiers in result records along with this procedure's
 VAL-THERMAL-001/002 questions. Passing software fixtures, a plausible scalar or
 a zero scanner result cannot replace actual-card outcomes. Unsupported or
-inconclusive required results keep hardware acceptance and stable promotion held.
+inconclusive required results keep hardware acceptance and promotion of qualified RTX 5090 support held.
 
 ## Exact615 candidate validation definition — 14 October 2026
 
@@ -58,4 +58,4 @@ The owner-approved combined source/host plan now permits experimental exact615.7
 
 For VAL-THERMAL-001, the authorized lab operator and owner assess whether seven admitted final-stack GPUs produce fresh valid memory temperatures with stable BDF/UUID binding and bounded helper lifetime; retain exact loaded driver/kernel/build/command and raw update evidence. Hardware stress and final615/7.0 operational admission remain separate gated work under the combined authority. For VAL-THERMAL-002, an independent maintainer/reviewer checks the three exact source pins,3144/3152/3184 layouts,102-record lock, three matching and six mismatched native driver-free C pairs, Python security regressions and unknown-profile rejection. Native syntax-only C/Rust tests cannot establish ioctl execution, sensor accuracy or final hardware qualification.
 
-Expected evidence: `.traceweaver/rtx5090-615/evidence/` for source RED/GREEN/C/dependency/build receipts and `.traceweaver/rtx5090-615/software-verification.json` for the tested candidate hash; private final-stack operational receipts for real-card validation. Owner: Hannes Zietsman; implementation participation is disclosed and independent Astra source review is required. Missing/failed evidence is HOLD; no source-test pass closes full accuracy/reference/extended-soak or public/stable acceptance.
+Expected evidence: `.traceweaver/rtx5090-615/evidence/` for source RED/GREEN/C/dependency/build receipts and `.traceweaver/rtx5090-615/software-verification.json` for the tested candidate hash; private final-stack operational receipts for real-card validation. Owner: Hannes Zietsman; implementation participation is disclosed and independent Astra source review is required. Missing/failed evidence is HOLD; no source-test pass closes full accuracy/reference/extended-soak or acceptance of qualified RTX 5090 support. The separately authorized versioned software release retains these qualification limits.

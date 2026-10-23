@@ -1,7 +1,7 @@
 <!-- TRACEWEAVER: file-role=thermal-support-guide; req=REQ-THERMAL-012; trace=TRACE-THERMAL-012; ver=VER-THERMAL-010 -->
 # GPU thermal methods
 
-The development build adds opt-in aggregate memory temperature. `legacy` remains the default and never starts the new helper. RTX 5090 RUSD support is an experimental candidate; software tests do not establish hardware accuracy or production noninterference.
+The source adds opt-in aggregate memory temperature. `legacy` remains the default and never starts the new helper. RTX 5090 RUSD support is an experimental candidate; software tests do not establish hardware accuracy or production noninterference.
 
 | Method | Behavior |
 | --- | --- |
@@ -32,7 +32,7 @@ The optional batch deadline includes parent pipe I/O and waiting for successful 
 
 Existing scalar names and labels remain intact, including the established zero failure sentinel. `DCXP_FI_DEV_VRAM_TEMP_VALID` distinguishes unavailable zero from a measured zero. `DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO` exposes finite `backend` and `status` labels. `DCXP_GPU_SUPPORTED` is one only for a current valid, non-approximated memory measurement; the old datacenter placeholder zero is unsupported. TUI detail shows the selected method and status.
 
-Development publication retains version `0.2.7` and default `legacy`. Stable main/tag/release promotion waits for accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
+Development retains version `0.2.7` and default `legacy`. Confine the owner-approved v0.3.0 version bump to its reviewed main promotion, then require the accepted protected-main build, exact source tag and verified publisher readback before publication is considered complete. That versioned release may contain opt-in experimental RUSD without qualifying RTX 5090 support. Qualified support promotion requires accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
 
 ## VM register-policy correction candidate
 
@@ -40,6 +40,6 @@ The source candidate's direct-register policy includes guest-agent commands: `--
 
 Guest register eligibility is separate from host thermal compatibility. The validated guest BAR profile set is empty, so guest BAR reads remain disabled with either flag setting. A future profile requires the exact guest PCI device, architecture, driver/environment, permitted register mechanism and offsets, and validation evidence. A model-name substring or host RUSD profile cannot establish guest eligibility. No new guest RUSD backend or RTX5090/Ada guest-memory support is claimed. Supplied valid guest temperature fixtures preserve their values and provenance only after unambiguous guest-to-host BDF mapping; unsupported or missing sensors remain unavailable.
 
-Operational acceptance remains **HELD** under the [bounded VM procedure](validation/vm-passthrough-acceptance.md). This document supplies no software/build or live pass result. Package `0.2.7`, default `legacy`, metric/status contracts, TUI and CryptoLabs branding remain the preservation contract.
+Operational acceptance remains **HELD** under the [bounded VM procedure](validation/vm-passthrough-acceptance.md). This document supplies no software/build or live pass result. The development package remains `0.2.7`; the reviewed main promotion carries `0.3.0`. Default `legacy`, metric/status contracts, TUI and CryptoLabs branding remain the preservation contract in both channels.
 
-Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; devversion0.2.7 and defaultlegacy are preserved.
+Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; development version `0.2.7` and default `legacy` are preserved; a main-only release version bump supplies no hardware or live VM acceptance evidence.

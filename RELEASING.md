@@ -2,10 +2,22 @@
 
 ## Branch and version policy
 
-Development changes go to `dev`; keep version **0.2.7** during this preparation.
+Development changes go to `dev`; retain its development version **0.2.7**.
 An accepted merge to release branch `main` carries the separately approved
 semantic version bump and release tag. The trusted build runs from the protected
 branch commit, not from an arbitrary tag or contribution head.
+
+For the owner-approved v0.3.0 software release, prepare the root Cargo
+manifest and lock version bump to `0.3.0` as part of the reviewed promotion PR
+to `main`, leaving `dev` at `0.2.7`. Build the accepted protected-main commit,
+verify its exact artifacts, then tag that same source commit `v0.3.0`. Tags do
+not trigger the trusted source build. Publish the accepted protected-main bytes
+through the separately reviewed versioned publisher and verify public readback.
+
+This versioned software release may include opt-in experimental RTX 5090 RUSD
+and VM diagnostics while full hardware and live VM qualification remain pending.
+It preserves default `legacy`, metric/status contracts and the terminal UI.
+Qualification of RTX 5090 support still requires the actual-card evidence below.
 
 The source repository has a clean standalone root. Reviewed child commits extend
 that history; never push old private parents, tags or refs into it. Retain the
@@ -49,7 +61,8 @@ before allowing new work. A YAML condition or label alone is not admission.
 Source: [dc-exporter-rs-public](https://github.com/cryptolabsza/dc-exporter-rs-public).
 Downloads: [dc-exporter-releases](https://github.com/cryptolabsza/dc-exporter-releases/releases).
 Development output uses `dev-latest`; the original private repository/history
-remain private. Existing public assets remain unchanged during this preparation.
+remain private. Preserve historical stable assets and their original provenance
+when publishing a new versioned release.
 
 The owner must accept the exact tree, Actions logs/summaries/artifacts, complete
 notices, legacy BAR provenance/disclosure and private security-reporting readiness
