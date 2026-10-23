@@ -1,50 +1,76 @@
-# Releasing DC Exporter
+# Releasing CryptoLabs DC Exporter
 
 ## Branch and version policy
 
-All development is committed on `dev`. Keep `Cargo.toml` at the existing version
-while working on dev; the public-launch development baseline is **0.2.7**.
-`main` is the release branch. Bump the version only as part of an approved
-merge from dev to main, then tag that release using semantic versioning.
-Do not copy historical private-source tags into the fresh source repository.
+Development changes go to `dev`; retain its development version **0.2.7**.
+An accepted merge to release branch `main` carries the separately approved
+semantic version bump and release tag. The trusted build runs from the protected
+branch commit, not from an arbitrary tag or contribution head.
 
-The initial standalone snapshot has no old parents, tags or fork/import history.
-Maintain its private old-to-new commit mapping and exact file manifest separately.
-Subsequent reviewed commits can extend the new history normally.
+For the owner-approved v0.3.0 software release, prepare the root Cargo
+manifest and lock version bump to `0.3.0` as part of the reviewed promotion PR
+to `main`, leaving `dev` at `0.2.7`. Build the accepted protected-main commit,
+verify its exact artifacts, then tag that same source commit `v0.3.0`. Tags do
+not trigger the trusted source build. Publish the accepted protected-main bytes
+through the separately reviewed versioned publisher and verify public readback.
 
-## Before a stable release
+This versioned software release may include opt-in experimental RTX 5090 RUSD
+and VM diagnostics while full hardware and live VM qualification remain pending.
+It preserves default `legacy`, metric/status contracts and the terminal UI.
+Qualification of RTX 5090 support still requires the actual-card evidence below.
 
-1. Review the exact tested tree, software results, license/provenance and release
-   notes. A new stable RTX 5090 support claim requires accepted real-card evidence
-   from [the lab procedure](docs/validation/rtx5090-acceptance.md).
-2. Merge accepted dev work to main with the approved patch/minor/major version
-   bump. Do not change dev's version during feature work.
-3. Tag the accepted main commit. Verify that the trusted workflow, repository
-   numeric identity, protected ref, commit and tag/version agree.
-4. Build on the dedicated native ordinary-account runner, with the pinned
-   toolchain and GLIBC 2.34 import ceiling. Retain the exact binary/package/hash
-   manifest and the new-source workflow/run/artifact receipt.
-5. Publish through the dedicated bytes-only publisher. It validates authoritative
-   new-source identity, run/attempt, artifact identity, file allowlist and hashes.
-   It never executes artifact binaries or package hooks with publication authority.
-6. Verify the downloaded public bytes against the accepted artifact hashes.
-   Review Actions logs, summaries and artifacts for disclosure before making
-   fresh source history public.
+The source repository has a clean standalone root. Reviewed child commits extend
+that history; never push old private parents, tags or refs into it. Retain the
+old-to-new source mapping and exact export approval privately. Historical stable
+0.2.8 assets keep their original provenance and are not builds of this fresh tree.
 
-Manual root build-server commands and credential-bearing staging are not part
-of this release path. Public PR/fork heads do not run on either persistent VM.
-A workflow label alone does not establish admission or isolation.
+## Build and verify
 
-## Release destinations and holds
+1. Review the exact protected source commit, immutable caller/recipe pin, software
+   results, notices and provenance. Public PR/fork/unreviewed refs are ineligible.
+2. Build on the shared ephemeral runner pool using the pinned Rust container,
+   locked dependencies, driver-free ABI assertions before Cargo and GLIBC 2.34
+   import ceiling. Preserve source ID `1416116330`, SHA, run and attempt.
+3. Verify the ten-entry distribution ZIP: executable, two DEBs, `BUILD_INFO.txt`,
+   `VERSION.txt`, `HELP.txt`, `SYMBOLS.txt`, `THIRD-PARTY-NOTICES.md`, `SHA256SUMS`
+   and `manifest.json`. The manifest covers nine assets and checksums cover eight.
+4. Independently compare the locked Linux non-dev graph to the notice inventory;
+   inspect actual licence texts and exact notice equality in both DEBs at
+   `/usr/share/doc/dc-exporter-rs/copyright`. Missing licensing blocks distribution.
+   The packaged executable is `/usr/local/bin/dc-exporter-rs`; the maintained
+   `dc-exporter.service` starts it on port9835.
+5. Use the trusted bytes-only publisher in its scoped ephemeral lane. It checks
+   authoritative new-source workflow/ref/SHA/run/attempt/artifact identity, strict
+   names/sizes/hashes and the agreed schema. It never executes downloaded binaries,
+   package hooks or source code with publication authority. Retained private-source
+   builds remain invalid even when their filenames or hashes happen to match.
+6. Rehearse validation and recovery without replacing public assets. Recovery must
+   restore prior legitimate smaller asset sets byte-for-byte across the schema
+   transition. Compare any later public downloads to the exact accepted hashes.
 
-Source: [cryptolabsza/dc-exporter-rs-public](https://github.com/cryptolabsza/dc-exporter-rs-public).
-Binaries and DEBs remain in
-[cryptolabsza/dc-exporter-releases](https://github.com/cryptolabsza/dc-exporter-releases).
-Development output uses `dev-latest` there. Historical stable assets keep their
-original provenance; do not relabel private-backup artifacts as fresh-source builds.
+## Admission and publication gates
 
-The old source repository, history and CI records remain private. The new source
-starts private with Actions held until effective secret/ref/runner controls and
-rehearsals pass. Public visibility requires separate owner approval of the exact
-tree and CI disclosures. Legacy-register disclosure/provenance and hardware
-acceptance remain held. See [public publishing](docs/public-publishing.md).
+The same source recipe selects the private staging lane while the repository is
+private and the public ephemeral lane after an explicit visibility decision.
+The event's typed repository identity/private/visibility fields select that lane;
+unknown or inconsistent payloads fail closed. Effective group/workflow selection,
+protected refs, secret access and runtime boundaries require live verification.
+Hold Actions during any visibility/routing transition and verify those controls
+before allowing new work. A YAML condition or label alone is not admission.
+
+Source: [dc-exporter-rs-public](https://github.com/cryptolabsza/dc-exporter-rs-public).
+Downloads: [dc-exporter-releases](https://github.com/cryptolabsza/dc-exporter-releases/releases).
+Development output uses `dev-latest`; the original private repository/history
+remain private. Preserve historical stable assets and their original provenance
+when publishing a new versioned release.
+
+The owner must accept the exact tree, Actions logs/summaries/artifacts, complete
+notices, legacy BAR provenance/disclosure and private security-reporting readiness
+before public source visibility. Public asset replacement requires its own final
+approval. Stable RTX5090 promotion additionally requires accepted actual-card
+accuracy, GPU Burn/NCCL and noninterference evidence. Exact ABI profiles and
+limited functional readings do not establish that qualification.
+
+Rollback disables only this candidate's new workflow/admission/publication path;
+preserve private history, old public assets, unrelated pool routes and capacity.
+See [public publishing](docs/public-publishing.md) and [testing](TESTING.md).

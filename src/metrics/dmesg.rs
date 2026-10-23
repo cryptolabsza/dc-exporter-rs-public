@@ -135,7 +135,7 @@ where
 }
 
 /// Parse dmesg output lines for GPU errors
-fn parse_lines(content: &str, errors: &mut DmesgGpuErrors) {
+pub(super) fn parse_lines(content: &str, errors: &mut DmesgGpuErrors) {
     errors.read_succeeded = true;
 
     for line in content.lines() {
@@ -173,7 +173,7 @@ fn parse_lines(content: &str, errors: &mut DmesgGpuErrors) {
         // Pattern 3: XID errors
         // "NVRM: Xid (PCI:0000:c2:00.0): 79, pid=1234, GPU has fallen off the bus"
         // "nvidia 0000:c2:00.0: Xid (0000:c2:00.0): 48, ..."
-        if line.contains("Xid") || line.contains("xid") {
+        if line_upper.contains("XID") {
             if let Some((pci_id, xid_code)) = extract_xid_error(line) {
                 let entry = errors.per_gpu.entry(pci_id).or_default();
                 entry.xid_errors.push(xid_code);
@@ -248,64 +248,39 @@ fn extract_pci_id_from_nvrm(line: &str) -> Option<String> {
     extract_pci_bus_id(line)
 }
 
-/// Extract XID error code and PCI bus ID from a line
-fn extract_xid_error(line: &str) -> Option<(String, u32)> {
-    let pci_id = extract_pci_id_from_nvrm(line)?;
-    
-    // Find "Xid" or "xid" followed by various formats
-    let xid_pos = line.to_lowercase().find("xid")?;
-    let after_xid = &line[xid_pos..];
-    
-    // Look for the error code after "): " or ": "
-    // "Xid (PCI:0000:c2:00.0): 79, ..."
-    if let Some(colon_pos) = after_xid.find("): ") {
-        let code_str = &after_xid[colon_pos + 3..];
-        let code_end = code_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(code_str.len());
-        if code_end > 0 {
-            if let Ok(code) = code_str[..code_end].parse::<u32>() {
-                return Some((pci_id, code));
-            }
-        }
-    }
-    
-    None
+/// Parse the PCI token belonging to Xid, never another address elsewhere in a log.
+fn extract_xid_error(line:&str)->Option<(String,u32)> {
+    let lower=line.to_ascii_lowercase();let start=lower.find("xid")?;
+    let after=&line[start+3..];let open=after.find('(')?;let close=after[open+1..].find(')')?+open+1;
+    let raw=&after[open+1..close];
+    let raw=if raw.get(..4).is_some_and(|s|s.eq_ignore_ascii_case("pci:")) {&raw[4..]}else{raw};
+    let pci=canonical_pci_token(raw)?;
+    let value=after[close+1..].strip_prefix(':')?.trim_start();
+    let end=value.find(|c:char|!c.is_ascii_digit()).unwrap_or(value.len());
+    if end==0 {return None;}let code=value[..end].parse().ok()?;
+    Some((pci,code))
 }
-
-/// Extract a PCI bus ID (xxxx:xx:xx.x format) from text
-fn extract_pci_bus_id(text: &str) -> Option<String> {
-    // Find pattern like "0000:c2:00.0"
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    
-    for i in 0..len {
-        // Try to match xxxx:xx:xx.x (12 characters)
-        if i + 12 <= len {
-            let candidate = &text[i..i + 12];
-            if is_pci_bus_id(candidate) {
-                return Some(candidate.to_lowercase());
-            }
-        }
-    }
-    
-    None
+/// Canonical full or functionless token; native NVML may use an eight-digit domain.
+pub(super) fn canonical_pci_token(raw:&str)->Option<String> {
+    let fields:Vec<_>=raw.split(':').collect();if fields.len()!=3 {return None;}
+    if !matches!(fields[0].len(),4|8) || fields[1].len()!=2 {return None;}
+    if !fields[0].bytes().all(|b|b.is_ascii_hexdigit()) || !fields[1].bytes().all(|b|b.is_ascii_hexdigit()) {return None;}
+    let domain=u32::from_str_radix(fields[0],16).ok()?;if domain>0xffff {return None;}
+    let bus=u8::from_str_radix(fields[1],16).ok()?;
+    let parts:Vec<_>=fields[2].split('.').collect();if !(parts.len()==1||parts.len()==2) || parts[0].len()!=2 {return None;}
+    if !parts[0].bytes().all(|b|b.is_ascii_hexdigit()) {return None;}
+    let device=u8::from_str_radix(parts[0],16).ok()?;if device>31 {return None;}
+    let base=format!("{domain:04x}:{bus:02x}:{device:02x}");
+    if parts.len()==1 {return Some(base);}
+    if parts[1].len()!=1 {return None;}let function=parts[1].parse::<u8>().ok()?;if function>7 {return None;}
+    Some(format!("{base}.{function}"))
 }
-
-/// Check if a string looks like a PCI bus ID (xxxx:xx:xx.x)
-fn is_pci_bus_id(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() != 12 {
-        return false;
-    }
-    
-    // xxxx:xx:xx.x
-    bytes[0..4].iter().all(|b| b.is_ascii_hexdigit())
-        && bytes[4] == b':'
-        && bytes[5..7].iter().all(|b| b.is_ascii_hexdigit())
-        && bytes[7] == b':'
-        && bytes[8..10].iter().all(|b| b.is_ascii_hexdigit())
-        && bytes[10] == b'.'
-        && bytes[11].is_ascii_hexdigit()
+fn extract_pci_bus_id(text:&str)->Option<String> {
+    text.split(|c:char|!(c.is_ascii_hexdigit()||c==':'||c=='.'))
+        .filter_map(|token|canonical_pci_token(token.trim_matches(':')))
+        .find(|token|token.len()==12)
 }
+fn is_pci_bus_id(raw:&str)->bool {raw.len()==12 && canonical_pci_token(raw).is_some()}
 
 /// Push a recent error message, keeping only last 5
 fn push_recent_error(info: &mut GpuDmesgInfo, line: &str) {
@@ -314,7 +289,9 @@ fn push_recent_error(info: &mut GpuDmesgInfo, line: &str) {
     }
     // Truncate long lines
     let msg = if line.len() > 200 {
-        format!("{}...", &line[..200])
+        let mut end=200;
+        while !line.is_char_boundary(end) {end-=1;}
+        format!("{}...", &line[..end])
     } else {
         line.to_string()
     };
@@ -395,4 +372,60 @@ mod tests {
         assert!(errors.per_gpu.contains_key("0000:23:00.0"));
         assert!(!errors.per_gpu.contains_key("0000:41:00.0"));
     }
+
+    // VER-HEALTH-004: sanitized observed NVIDIA prefix shapes; no tenant payload.
+    #[test]
+    fn health_definition_functionless_xid_prefixes_retain_observed_codes() {
+        for code in [109, 119, 154] {
+            let line = format!("NVRM: Xid (PCI:0000:61:00): {}, diagnostic omitted", code);
+            assert_eq!(extract_xid_error(&line), Some(("0000:61:00".into(),code)), "{line}");
+        }
+    }
+
+    #[test]
+    fn health_definition_uppercase_xid_and_full_bdf_are_accepted() {
+        assert_eq!(extract_xid_error("NVRM: XID (PCI:0000:AF:00.0): 154, omitted"),
+            Some(("0000:af:00.0".into(),154)));
+        let mut errors = DmesgGpuErrors::default();
+        parse_lines("NVRM: XID (PCI:0000:AF:00.0): 154, omitted", &mut errors);
+        assert_eq!(errors.per_gpu.get("0000:af:00.0").map(|x| x.xid_errors.as_slice()), Some(&[154][..]));
+    }
+
+    #[test]
+    fn health_definition_invalid_pci_tokens_cannot_match_another_card() {
+        for token in ["0000:61:00.8", "0000:61:20.0", "x0000:61:00.0", "00000:61:00.0", "0000:61:00.00"] {
+            assert_eq!(extract_xid_error(&format!("NVRM: Xid (PCI:{}): 79, omitted",token)),None,"{token}");
+        }
+    }
+
+    #[test]
+    fn health_definition_xid_snapshot_reads_do_not_accumulate() {
+        let read = || parse_first_available_source(
+            || Some("NVRM: Xid (PCI:0000:61:00.0): 154, omitted\nNVRM: Xid (PCI:0000:61:00.0): 154, omitted".into()),
+            || None, || None);
+        assert_eq!(read().per_gpu["0000:61:00.0"].xid_errors, vec![154,154]);
+        assert_eq!(read().per_gpu["0000:61:00.0"].xid_errors, vec![154,154]);
+        let failed = parse_first_available_source(||None,||None,||None);
+        let empty = parse_first_available_source(||Some(String::new()),||None,||None);
+        assert!(!failed.read_succeeded);
+        assert!(empty.read_succeeded);
+        assert_eq!(empty.source,Some(DmesgSource::FlaggedDmesg));
+    }
+
+    #[test]
+    fn health_definition_unicode_kernel_prefix_does_not_panic_or_hide_xid() {
+        let actual=extract_xid_error("é kernel: NVRM: Xid (PCI:0000:61:00.0): 154, omitted");
+        assert_eq!(actual,Some(("0000:61:00.0".into(),154)));
+        assert_eq!(extract_pci_bus_id("é no valid pci token here"),None);
+    }
+
+    #[test]
+    fn health_definition_long_unicode_log_payload_is_truncated_at_character_boundary() {
+        let prefix="NVRM: Xid (PCI:0000:53:00.0): 154, ";
+        let line=format!("{}{}éend",prefix,"x".repeat(199-prefix.len()));
+        let mut errors=DmesgGpuErrors::default();parse_lines(&line,&mut errors);
+        assert_eq!(errors.per_gpu["0000:53:00.0"].xid_errors,vec![154]);
+        assert!(errors.per_gpu["0000:53:00.0"].recent_errors[0].ends_with("..."));
+    }
+
 }

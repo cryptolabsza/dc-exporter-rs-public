@@ -12,6 +12,100 @@ fn request() -> RmRequest {
     }
 }
 
+// REQ-THERMAL-003/005/009: exact source-reviewed profiles, never a driver family.
+#[test]
+fn exact_615_profile_retains_all_platform_and_device_gates() {
+    for driver in ["590.48.01", "595.99.02", "615.71.09"] {
+        let mut r = request();
+        r.driver_version = driver.into();
+        assert!(profile_supported(&r, "linux", "x86_64"), "{driver}");
+        for (os, arch) in [
+            ("macos", "x86_64"),
+            ("windows", "x86_64"),
+            ("linux", "aarch64"),
+            ("linux", "x86"),
+        ] {
+            assert!(!profile_supported(&r, os, arch), "{driver}/{os}/{arch}");
+        }
+        r.device_id = 0x2684;
+        assert!(!profile_supported(&r, "linux", "x86_64"));
+    }
+    for driver in [
+        "590.48.02",
+        "595.99.01",
+        "595.99.03",
+        "595.71.05",
+        "595.99.02-open",
+        "595.99.02 ",
+        "0595.99.02",
+        "600.00.00",
+        "615.71.08",
+        "615.71.10",
+        "615.71.09-open",
+        "615.71.09 ",
+        "615.78.08",
+        "999.00.00",
+    ] {
+        let mut r = request();
+        r.driver_version = driver.into();
+        assert!(!profile_supported(&r, "linux", "x86_64"), "{driver}");
+    }
+}
+
+// REQ-THERMAL-003/005: the request must match the independent running driver.
+#[test]
+fn running_driver_gate_matches_the_requested_exact_profile() {
+    let proc_version = |version: &str| {
+        format!(
+        "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64 {version} Release Build\nGCC version: gcc 13.3.0\n"
+    )
+    };
+    for requested in ["590.48.01", "595.99.02", "615.71.09"] {
+        assert!(running_driver_matches(requested, &proc_version(requested)));
+        for running in [
+            "590.48.01",
+            "595.99.02",
+            "595.99.01",
+            "595.99.03",
+            "595.99.02-open",
+            "600.00.00",
+            "615.71.09",
+            "615.71.09-open",
+            "615.71.10",
+        ] {
+            assert_eq!(
+                running_driver_matches(requested, &proc_version(running)),
+                requested == running,
+                "request {requested}, running {running}"
+            );
+        }
+        assert!(!running_driver_matches(requested, ""));
+        assert!(!running_driver_matches(
+            requested,
+            &format!("GCC version: {requested}\n")
+        ));
+        assert!(!running_driver_matches(
+            requested,
+            &format!("{}\nGCC version: {requested}\n", proc_version("999.00.00"))
+        ));
+        assert!(!running_driver_matches(
+            requested,
+            &format!(
+                "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64 590.48.01 595.99.02\n"
+            )
+        ));
+    }
+    // Exact matching alone cannot authorize an unreviewed profile.
+    assert!(!running_driver_matches(
+        "999.00.00",
+        &proc_version("999.00.00")
+    ));
+    assert!(!running_driver_matches(
+        "595.99.02 ",
+        &proc_version("595.99.02")
+    ));
+}
+
 #[test]
 fn profile_is_exact_and_platform_gated() {
     assert!(profile_supported(&request(), "linux", "x86_64"));
@@ -94,6 +188,39 @@ fn identity_requires_full_bdf_uuid_minor_and_current_binding() {
     assert_eq!(verify_identity(&r, &id), Err(RmStatus::DeviceLost));
 }
 
+// REQ-THERMAL-003/011/012: admitting 595 preserves identity and owned cleanup.
+#[test]
+fn each_exact_profile_rejects_wrong_identity_and_cleans_up_after_verification_failure() {
+    for driver in ["590.48.01", "595.99.02", "615.71.09"] {
+        let mut r = request();
+        r.driver_version = driver.into();
+        let mut id = DeviceIdentity {
+            pci_bus_id: "0000:23:00.0".into(),
+            uuid: r.uuid.clone(),
+            vendor_id: 0x10de,
+            device_id: 0x2b85,
+            minor: 4,
+            rm_minor: 4,
+            bound_to_nvidia: true,
+        };
+        assert_eq!(verify_identity(&r, &id), Ok(()));
+        id.device_id = 0x2684;
+        assert_eq!(verify_identity(&r, &id), Err(RmStatus::DeviceLost));
+        id.device_id = 0x2b85;
+        id.minor = 5;
+        assert_eq!(verify_identity(&r, &id), Err(RmStatus::DeviceLost));
+        id.minor = 4;
+        id.uuid = "GPU-ffffffff-ffff-ffff-ffff-ffffffffffff".into();
+        assert_eq!(verify_identity(&r, &id), Err(RmStatus::DeviceLost));
+        let mut mock = Mock::default();
+        assert_eq!(
+            with_session(&mut mock, |_| verify_identity(&r, &id)),
+            Err(RmStatus::DeviceLost)
+        );
+        assert_eq!(mock.transcript, session_transcript());
+    }
+}
+
 #[test]
 fn signed_24_8_precision_zero_negative_and_overflow() {
     assert_eq!(decode_temperature(55 * 256 + 128), Ok(55.5));
@@ -166,6 +293,102 @@ fn mapped_byte_boundaries_are_checked_before_reading() {
     page[MEMORY_VALUE_OFFSET..MEMORY_VALUE_OFFSET + 4]
         .copy_from_slice(&(55i32 * 256 + 64).to_le_bytes());
     assert_eq!(snapshot_bytes(&page).unwrap().celsius, 55.25);
+}
+
+// REQ-THERMAL-005/009: a 590-sized buffer must never satisfy the 595 decoder.
+#[test]
+fn selected_profile_checks_full_bounds_and_uses_common_signed_thermal_fields() {
+    for driver in ["590.48.01", "595.99.02", "615.71.09"] {
+        let profile = profile_for_driver(driver).unwrap();
+        for length in [
+            0,
+            MEMORY_TIMESTAMP_OFFSET + 7,
+            MEMORY_VALUE_OFFSET + 3,
+            profile.shared_size - 1,
+        ] {
+            assert_eq!(
+                snapshot_bytes_for_profile(&vec![0; length], profile),
+                Err(RmStatus::Invalid),
+                "{driver}/{length}"
+            );
+        }
+        for length in [profile.shared_size, profile.mapping_length(4096).unwrap()] {
+            let mut page = vec![0; length];
+            page[MEMORY_TIMESTAMP_OFFSET..MEMORY_TIMESTAMP_OFFSET + 8]
+                .copy_from_slice(&10u64.to_le_bytes());
+            for (raw, expected) in [
+                (0, Ok(0.0)),
+                (55 * 256 + 64, Ok(55.25)),
+                (-256, Err(RmStatus::Invalid)),
+                (i32::MAX, Err(RmStatus::Invalid)),
+            ] {
+                page[MEMORY_VALUE_OFFSET..MEMORY_VALUE_OFFSET + 4]
+                    .copy_from_slice(&raw.to_le_bytes());
+                assert_eq!(
+                    snapshot_bytes_for_profile(&page, profile).map(|s| s.celsius),
+                    expected,
+                    "{driver}/{length}/{raw}"
+                );
+            }
+            page[MEMORY_VALUE_OFFSET..MEMORY_VALUE_OFFSET + 4]
+                .copy_from_slice(&(55i32 * 256).to_le_bytes());
+            for marker in [0u64, u64::MAX, SEQ_START + 1] {
+                page[MEMORY_TIMESTAMP_OFFSET..MEMORY_TIMESTAMP_OFFSET + 8]
+                    .copy_from_slice(&marker.to_le_bytes());
+                assert_eq!(
+                    snapshot_bytes_for_profile(&page, profile),
+                    Err(RmStatus::Invalid)
+                );
+            }
+        }
+    }
+    let baseline = profile_for_driver("590.48.01").unwrap();
+    let candidate = profile_for_driver("595.99.02").unwrap();
+    let mut page = vec![0; baseline.shared_size];
+    page[MEMORY_TIMESTAMP_OFFSET..MEMORY_TIMESTAMP_OFFSET + 8]
+        .copy_from_slice(&10u64.to_le_bytes());
+    page[MEMORY_VALUE_OFFSET..MEMORY_VALUE_OFFSET + 4]
+        .copy_from_slice(&(55i32 * 256).to_le_bytes());
+    assert_eq!(
+        snapshot_bytes_for_profile(&page, baseline).unwrap().celsius,
+        55.0
+    );
+    assert_eq!(
+        snapshot_bytes_for_profile(&page, candidate),
+        Err(RmStatus::Invalid)
+    );
+    for driver in ["595.99.02", "615.71.09"] {
+        let profile = profile_for_driver(driver).unwrap();
+        for shorter in [3144, 3152]
+            .into_iter()
+            .filter(|size| *size < profile.shared_size)
+        {
+            assert_eq!(
+                snapshot_bytes_for_profile(&vec![0; shorter], profile),
+                Err(RmStatus::Invalid)
+            );
+        }
+    }
+    for (driver_version, shared_size) in [
+        ("595.99.02", 0),
+        ("595.99.02", MEMORY_VALUE_OFFSET + 3),
+        ("595.99.02", baseline.shared_size),
+        ("595.99.02", usize::MAX),
+        ("615.71.09", 3152),
+    ] {
+        let malformed = AbiProfile {
+            driver_version,
+            shared_size,
+        };
+        assert_eq!(
+            snapshot_bytes_for_profile(&[], malformed),
+            Err(RmStatus::Invalid)
+        );
+        assert_eq!(
+            snapshot_bytes_for_profile(&page, malformed),
+            Err(RmStatus::Invalid)
+        );
+    }
 }
 
 #[test]
@@ -342,9 +565,12 @@ fn result_wire_status_is_finite_and_no_valid_error_temperature() {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 #[test]
 fn unsupported_platform_never_opens_driver() {
-    let result =
-        nvidia_rm::collect_batch(&[request()], Duration::from_secs(1), Duration::from_secs(1));
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].status, RmStatus::Unsupported);
-    assert_eq!(result[0].celsius, None);
+    for driver in ["590.48.01", "595.99.02", "615.71.09"] {
+        let mut r = request();
+        r.driver_version = driver.into();
+        let result = nvidia_rm::collect_batch(&[r], Duration::from_secs(1), Duration::from_secs(1));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, RmStatus::Unsupported);
+        assert_eq!(result[0].celsius, None);
+    }
 }

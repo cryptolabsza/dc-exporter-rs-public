@@ -1,13 +1,14 @@
+# TRACEWEAVER: file-role=distribution-service-contract; req=REQ-PUB-007; trace=TRACE-PUB-007; ver=VER-PUB-007
 [Unit]
 Description=DC Exporter - GPU Metrics for Prometheus
-Documentation=https://github.com/CrypotAI/dc-exporter
+Documentation=https://github.com/cryptolabsza/dc-exporter-rs-public
 After=network.target nvidia-persistenced.service
 Wants=nvidia-persistenced.service
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/dc-exporter --config /etc/dc-exporter/config.toml --port 9400
+ExecStart=/usr/local/bin/dc-exporter-rs --port 9835
 Restart=always
 RestartSec=10
 StandardOutput=journal

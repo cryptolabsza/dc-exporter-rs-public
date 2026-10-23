@@ -32,10 +32,20 @@ files/directories are rejected.
 
 Every source/test/package byte and mode must equal the baseline, except the
 explicitly permitted documentation, CI, license and new export/test paths.
-Cargo changes are restricted to the public repository URL; the version remains
-0.2.7. Deployment-helper changes are restricted to example-identifier sanitization.
+The initial import contract restricts Cargo changes to the public repository URL
+and the separately reviewed exact VM parser dependency exception; its version
+remains 0.2.7. Deployment-helper changes are restricted to example-identifier sanitization.
 Each actual exception requires a separate reason; stale/extra reason entries fail.
 The helper does not grant approval merely by producing a candidate manifest.
+
+The owner-approved v0.3.0 software release is a subsequent reviewed public-source
+promotion, not a new import of private history. Its main promotion PR changes
+only the root Cargo manifest/lock package versions to `0.3.0`; `dev` retains
+`0.2.7`. This does not broaden the export helper's package-change permissions.
+Require an accepted protected-main build, source tag on that exact commit and
+verified publisher readback for versioned asset publication. RTX 5090 stays
+opt-in and experimental, default `legacy` is preserved,
+and full hardware and live VM acceptance remain held.
 
 Example operator sequence, with full reviewed commit SHAs and a reviewed external
 JSON reason map supplied through environment variables:
@@ -55,8 +65,8 @@ python3 scripts/public_export.py verify --output "$SCRATCH/public-tree" \
 
 Keep candidate approvals and export receipts private: they contain the old/new
 mapping and excluded-file inventory. The verifier requires an exact path/hash/mode
-match and no Git metadata. After the exact tree is accepted, a separate operator
-creates one parentless root in a standalone repository. Never copy `.git`, use a
+match and no Git metadata. The source destination already has one parentless clean root. After the exact
+tree is accepted, a separate operator appends reviewed children to that root. Never copy `.git`, use a
 mirror/fork/template/import, preserve old tags, or push old refs into the new source.
 Initial approved branches resolve only to the clean root; later reviewed commits
 may grow its history. Verify the root, tree, refs and downloaded source archive
@@ -73,10 +83,11 @@ key blocks in selected content. They complement a separately reviewed credential
 scan, exact public-tree review and Actions log/summary/artifact review. A passing
 marker or secret-pattern scan is not proof that all confidential content is absent.
 
-The legacy BAR register implementation remains byte-for-byte preserved. Its
-historical provenance and confidentiality are not established by the RUSD public
-source notices. Owner clearance of that legacy disclosure remains required before
-public visibility; the export helper must not silently remove production code.
+The legacy BAR register implementation remains byte-for-byte preserved. Hannes
+Zietsman confirmed that the original C-derived implementation is his work and may
+be published. Retain the active Rust backend and historical research credits;
+the export helper must not silently remove production code. Final disclosure
+review of the public tree, history, logs and artifacts remains separate.
 
 The project already declares MIT and identifies CryptoLabs ZA in Cargo metadata.
 `LICENSE` records that declared permission and author identity without inventing
@@ -88,25 +99,52 @@ operator evidence/logs excluded. Third-party dependencies keep their own license
 
 ## Trusted CI and artifact publication
 
-Public PR/fork/unreviewed-ref code does not execute on either persistent VM.
-Reviewed protected dev/main refs are the only trusted build inputs. Dedicated
-ordinary-account native build/publisher runners require verified selected
-repository/workflow/ref admission, no sudo/rootful socket/admin mounts and no
-unrelated organization secrets. Build authority is read-only; publication authority
-is target-only and scoped to the release repository. Labels/YAML conditions alone
-cannot prove these control-plane or runtime boundaries.
+Official candidates use the shared ephemeral VM pool. Only reviewed protected
+`dev`/`main` pushes and manual dispatches from source1416116330 may reach the
+trusted recipe. Public forks, PR heads and unreviewed refs remain ineligible.
+The fully qualified caller pins a separately committed immutable recipe SHA;
+Actions must stay held until that recipe and the exact selected group policy
+have been admitted. No inherited organization secrets are part of the build.
 
-The bytes-only publisher admits the new source numeric ID and exact authoritative
-workflow/run/attempt/ref/commit/artifact identity, validates safe archive entries
-and exact file/hash manifests, and rejects retained-private-source runs even when
-names or SHAs match. It does not execute artifact code or package hooks. Do not
-reuse shared executable caches or relabel old-source runs as new-source evidence.
-Recheck effective policies after any visibility change, with listeners held.
-The hypervisor remains a trusted boundary; privileged workloads elsewhere on it
-are not repaired by this pipeline's isolation.
+The typed event repository identity and private/visibility fields select the
+private staging lane or future public lane. Unknown/inconsistent metadata fails
+closed. Hold Actions while changing visibility or routes, then verify effective
+runner/workflow/ref/secret policy against live repository metadata. Neither a
+label nor a workflow condition proves actual admission or runtime isolation.
 
-Only after exact software/artifact checks, admission denial tests, runtime inspection
-and rehearsal disclosure review may the owner approve public source visibility.
-Stable RTX 5090 promotion also requires actual accepted lab evidence. Recovery
-preserves the private backup and disables only this exporter's new publication path;
-never restore old history/private records into the public repository.
+The pinned guest-local Rust container runs as the ordinary guest UID with all
+capabilities dropped, no privilege gains and explicit CPU/memory/PID limits.
+It mounts only its disposable guest source directory. Host sockets, host keys,
+GPU devices and management mounts are excluded. The retained strict native
+builder is a separate path; its original guards have not been relaxed to fit
+the generic guest. Actual guest/VM/disk/registration cleanup must be verified.
+
+The driver-free exact590/595/615 ABI checks run before Cargo. Locked Linux
+metadata and actual licence files produce complete dependency notices; unresolved
+selected licensing fails the job. Retain the actual filtered metadata and
+independently compare its non-dev closure to the emitted notice inventory.
+Binary distributions include that generated notice and both DEBs carry exactly
+those bytes as `/usr/share/doc/dc-exporter-rs/copyright`.
+
+The distribution contract has ten ZIP entries, nine manifest assets and eight
+checksum rows, with no manifest/self checksum. The exact source identity,
+workflow/ref/SHA/run/attempt/artifact name and every permitted byte/hash must
+match. Each file is bounded to128MiB and all entries total200MiB. Separate
+notice-evidence artifacts support verification and are not release assets.
+
+The trusted bytes-only publisher runs in its separately admitted ephemeral lane,
+with source-only reader and release-only writer authority. It validates the
+new-source contract and never executes downloaded binaries, source or package
+hooks. Reject private-backup builds even if their names or bytes match. Keep
+legacy legitimate release-asset recovery compatible across the schema change;
+rehearse without writing public assets during preparation.
+
+Actual admission denial checks, a source1416116330 shared run, independent artifact
+inspection, cleanup and tree/log/artifact disclosure review remain prerequisites
+for acceptance. Preserve the old private source/history and existing public
+release assets. The owner confirmation above covers the original C-derived BAR
+implementation; comprehensive disclosure review, verified private vulnerability
+reporting and final owner visibility/asset approval remain separate gates.
+Stable RTX5090 promotion requires accepted real-card qualification; software
+checks and limited observed readings cannot replace it. Rollback disables only
+the new candidate path and preserves other repositories, routes and pool limits.

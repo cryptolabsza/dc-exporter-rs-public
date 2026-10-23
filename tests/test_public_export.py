@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=public-snapshot-abi-allowlist-verification; req=REQ-PUB-007; trace=TRACE-PUB-007; ver=VER-PUB-007
+# TRACEWEAVER: verifies=VER-PUB-007; req=REQ-PUB-007; trace=TRACE-PUB-007
 # TRACEWEAVER: file-role=public-snapshot-fixtures; req=REQ-PUB-002; trace=TRACE-PUB-002; ver=VER-PUB-002
 # TRACEWEAVER: verifies=VER-PUB-002; req=REQ-PUB-002; trace=TRACE-PUB-002
 """Offline public-snapshot acceptance fixtures; all Git mutations use scratch repos."""
@@ -10,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -83,6 +86,233 @@ class PublicExportTests(unittest.TestCase):
     def rejected(self, action):
         with self.assertRaises(self.exporter.ExportError):
             action()
+
+    def test_gpu_health_document_is_the_only_new_health_public_path(self):
+        self.assertIn("docs/gpu-health.md", self.exporter.PUBLIC_PATHS)
+        self.assertIn("docs/gpu-health.md", self.exporter.REVIEWED_CHANGE_PATHS)
+        for private in ("docs/validation/gpu-health-acceptance.md", ".traceweaver/gpu-health-2026-10-14/plan.md", "docs/gpu-health-private.md"):
+            self.assertNotIn(private, self.exporter.PUBLIC_PATHS)
+        self.put("docs/gpu-health.md", "# GPU health\nRecovery observations do not establish physical damage.\n")
+        commit = self.commit()
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        approval = self.approve(commit, {"docs/gpu-health.md": "Reviewed additive health metrics documentation"})
+        self.export(commit, approval)
+        self.assertEqual((self.output / "docs/gpu-health.md").read_text(), (self.repo / "docs/gpu-health.md").read_text())
+
+    def test_driver_free_abi_adds_exact_public_paths(self):
+        added = {"scripts/ci/rusd_abi.py", "scripts/ci/rusd-headers.json",
+                 "tests/test_ci_rusd_abi.py"}
+        baseline = frozenset("""
+.github/workflows/build.yml .gitignore Cargo.toml Cargo.lock LICENSE Makefile README.md
+RELEASING.md TESTING.md build.rs config.toml.example
+docs/gpu-thermal-abi.md docs/gpu-thermal-support.md docs/public-publishing.md
+docs/validation/rtx5090-acceptance.md docs/fixtures/rusd-abi-layout.c
+scripts/build-release.sh scripts/deploy.sh scripts/public_export.py
+scripts/ci/build_contract.py scripts/ci/build.sh
+src/config.rs src/main.rs src/safe_nvml.rs src/state.rs
+src/metrics/collector.rs src/metrics/dmesg.rs src/metrics/gpu.rs src/metrics/mod.rs
+src/metrics/nvidia_rm/abi.rs src/metrics/nvidia_rm/mod.rs src/metrics/nvidia_rm/rusd.rs
+src/metrics/pci.rs src/metrics/prometheus.rs src/metrics/register.rs
+src/metrics/thermal.rs src/metrics/thermal_worker.rs src/metrics/vm.rs
+src/tui/app.rs src/tui/mod.rs src/tui/ui.rs systemd/dc-exporter.service
+tests/nvidia_rm_abi.rs tests/nvidia_rm_rusd.rs tests/release_workflow.rs
+tests/thermal_policy.rs tests/thermal_worker.rs tests/test_public_export.py
+tests/test_ci_build.py
+""".split())
+        pool_paths = {".github/workflows/ci-pool-build-recipe.yml", "scripts/ci/pool-build.sh",
+                      "scripts/ci/pool_manifest.py", "scripts/ci/notice_inventory.py",
+                      "tests/test_pool_workflow.py", "tests/test_ci_notices.py",
+                      "CONTRIBUTING.md", "SECURITY.md", "THIRD-PARTY-NOTICES.md"}
+        self.assertEqual(self.exporter.PUBLIC_PATHS, baseline | added | pool_paths | {
+            "docs/gpu-health.md", "docs/validation/vm-passthrough-acceptance.md",
+            "docs/screenshots/rtx-5090-memory-temperatures.png",
+            "docs/screenshots/rtx-5000-ada-memory-temperatures.png"})
+        self.assertTrue(added.issubset(self.exporter.REVIEWED_CHANGE_PATHS))
+
+    def test_current_source_has_exact_65_paths_and_no_retired_publisher_pair(self):
+        self.assertEqual(len(self.exporter.PUBLIC_PATHS), 65)
+        for path in ['scripts/ci/publish.py', 'tests/test_ci_publisher.py']:
+            self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+            self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.assertFalse((SCRIPT.parents[1] / path).exists())
+
+    def test_explicit_new_65_file_canonical_baseline_exports_exact_tree(self):
+        expected = self.exporter.PUBLIC_PATHS - {'scripts/ci/publish.py', 'tests/test_ci_publisher.py'}
+        self.assertEqual(len(expected), 65)
+        for path in expected:
+            source = SCRIPT.parents[1] / path
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.chmod(source.stat().st_mode & 0o777)
+        commit = self.commit()
+        approval = self.approve(commit)
+        approval['baseline_commit'] = commit  # Explicit reviewed new canonical baseline.
+        manifest = self.export(commit, approval)
+        self.assertEqual(set(manifest['files']), expected)
+        self.assertEqual(len(manifest['files']), 65)
+        self.assertEqual(manifest['baseline_commit'], commit)
+        self.assertFalse((self.output / 'scripts/ci/publish.py').exists())
+        self.assertFalse((self.output / 'tests/test_ci_publisher.py').exists())
+
+    def test_old_baseline_with_retired_test_is_still_rejected_by_unknown_test_guard(self):
+        self.put('scripts/ci/publish.py', '# obsolete fixture publisher\n')
+        self.put('tests/test_ci_publisher.py', '# obsolete fixture test\n')
+        old_baseline = self.commit()
+        (self.repo / 'scripts/ci/publish.py').unlink()
+        (self.repo / 'tests/test_ci_publisher.py').unlink()
+        current = self.commit()
+        approval = self.approve(current)
+        approval['baseline_commit'] = old_baseline
+        with self.assertRaisesRegex(self.exporter.ExportError, 'Unknown production/test path'):
+            self.export(current, approval)
+
+    def test_vm_exact_document_and_three_runtime_paths_require_reviewed_hashes(self):
+        paths = {"docs/validation/vm-passthrough-acceptance.md": "# VM acceptance definition\nOperational acceptance HELD; fixture only.\n",
+                 "src/metrics/collector.rs": "// reviewed collector fixture\n",
+                 "src/metrics/vm.rs": "// reviewed guest mapping fixture\n",
+                 "src/metrics/pci.rs": "// reviewed assignment evidence fixture\n"}
+        for path, content in paths.items():
+            with self.subTest(policy_path=path):
+                self.assertIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.put(path, content)
+        commit = self.commit()
+        approval = self.approve(commit, {path: "Reviewed exact VM correction fixture" for path in paths})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        for path in paths:
+            with self.subTest(path=path):
+                missing_reason = copy.deepcopy(approval)
+                del missing_reason["changes"][path]
+                self.rejected(lambda: self.export(commit, missing_reason))
+                empty_reason = copy.deepcopy(approval)
+                empty_reason["changes"][path] = " "
+                self.rejected(lambda: self.export(commit, empty_reason))
+                missing_hash = copy.deepcopy(approval)
+                del missing_hash["files"][path]["sha256"]
+                self.rejected(lambda: self.export(commit, missing_hash))
+                wrong_hash = copy.deepcopy(approval)
+                wrong_hash["files"][path]["sha256"] = "0" * 64
+                self.rejected(lambda: self.export(commit, wrong_hash))
+        self.export(commit, approval)
+        for path in paths:
+            self.assertEqual((self.output / path).read_bytes(), self.git("show", commit + ":" + path))
+
+    def test_formatter_is_the_exact_fourth_runtime_change_exception(self):
+        expected = {"src/metrics/collector.rs", "src/metrics/vm.rs",
+                    "src/metrics/pci.rs", "src/metrics/prometheus.rs"}
+        self.put("src/metrics/prometheus.rs", "// exact reviewed formatter correction\n")
+        commit = self.commit()
+        approval = self.approve(commit, {"src/metrics/prometheus.rs": "Reviewed VM fault formatter"})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        wrong = copy.deepcopy(approval)
+        wrong["files"]["src/metrics/prometheus.rs"]["sha256"] = "0" * 64
+        self.rejected(lambda: self.export(commit, wrong))
+        self.export(commit, approval)
+        self.assertEqual({path for path in self.exporter.REVIEWED_CHANGE_PATHS
+                          if path.startswith("src/")}, expected)
+        self.assertEqual((self.output / "src/metrics/prometheus.rs").read_bytes(),
+                         self.git("show", commit + ":src/metrics/prometheus.rs"))
+
+    def screenshot_fixture(self):
+        expected = {
+            "docs/screenshots/rtx-5090-memory-temperatures.png":
+                "88dfe48021c2030b6dda7fdf2f391825ee8e3f5af10e2cd1581dd9b8b22e4c40",
+            "docs/screenshots/rtx-5000-ada-memory-temperatures.png":
+                "dd555bede41bde4ca8392b01de02ed8621a6fba0ededbdfc5d0c3b34793e24f4",
+        }
+        for path, sha in expected.items():
+            data = (SCRIPT.parents[1] / path).read_bytes()
+            self.assertEqual(digest(data), sha)
+            self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o644)
+        commit = self.commit()
+        approval = self.approve(commit, {path: "Reviewed redacted deployed 0.2.7 TUI capture"
+                                         for path in expected})
+        return expected, commit, approval
+
+    def test_exact_reviewed_pngs_export_real_immutable_bytes_and_modes(self):
+        expected, commit, approval = self.screenshot_fixture()
+        # Mutable working-tree bytes must not replace the approved Git blobs.
+        for path in expected:
+            (self.repo / path).write_bytes(b"unapproved mutable image")
+        manifest = self.export(commit, approval)
+        for path, sha in expected.items():
+            self.assertIn(path, self.exporter.PUBLIC_PATHS)
+            self.assertIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+            self.assertEqual(digest((self.output / path).read_bytes()), sha)
+            self.assertEqual((self.output / path).read_bytes(), self.git("show", commit + ":" + path))
+            self.assertEqual((self.output / path).stat().st_mode & 0o777, 0o644)
+            self.assertEqual(manifest["files"][path], {"sha256": sha, "mode": "100644"})
+
+    def test_reviewed_pngs_reject_wrong_hash_mode_missing_or_empty_reason(self):
+        expected, commit, approval = self.screenshot_fixture()
+        for path in expected:
+            with self.subTest(path=path):
+                for field, value in (("sha256", "0" * 64), ("mode", "100755")):
+                    wrong = copy.deepcopy(approval)
+                    wrong["files"][path][field] = value
+                    self.rejected(lambda: self.export(commit, wrong))
+                missing = copy.deepcopy(approval)
+                del missing["changes"][path]
+                self.rejected(lambda: self.export(commit, missing))
+                empty = copy.deepcopy(approval)
+                empty["changes"][path] = " "
+                self.rejected(lambda: self.export(commit, empty))
+
+    def test_reviewed_pngs_still_reject_private_content_with_matching_hash(self):
+        expected, _, _ = self.screenshot_fixture()
+        for path in expected:
+            with self.subTest(path=path):
+                target = self.repo / path
+                target.write_bytes(target.read_bytes() + b"/Us" + b"ers/private-operator")
+                commit = self.commit()
+                approval = self.approve(commit, {name: "Reviewed path does not bypass content checks"
+                                                 for name in expected})
+                self.rejected(lambda: self.export(commit, approval))
+                self.git("reset", "--hard", self.baseline)
+                self.screenshot_fixture()
+
+    def test_screenshot_selection_excludes_unknown_third_ada_and_private_paths(self):
+        for path in ("docs/screenshots/unknown.png", "docs/screenshots/rtx-6000-ada-memory-temperatures.png",
+                     ".traceweaver/screenshots/rtx-5090-memory-temperatures.png"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+                self.put(path, "unreviewed image fixture\n")
+                commit = self.commit()
+                approval = self.approve(commit)
+                approval["files"][path] = {"sha256": digest(self.git("show", commit + ":" + path)),
+                                           "mode": "100644"}
+                approval["changes"][path] = "A reason cannot expand literal selection"
+                self.rejected(lambda: self.export(commit, approval))
+                self.git("reset", "--hard", self.baseline)
+
+    def test_vm_review_cannot_admit_unrelated_new_public_paths(self):
+        for path in ("docs/validation/vm-private.md", "src/metrics/vm_extra.rs"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, self.exporter.PUBLIC_PATHS)
+                self.assertNotIn(path, self.exporter.REVIEWED_CHANGE_PATHS)
+                self.put(path, "// unrelated fixture\n")
+                commit = self.commit()
+                self.rejected(lambda: self.export(commit, self.approve(commit, {path: "Reviewed reason cannot expand policy"})))
+                self.git("reset", "--hard", self.baseline)
+
+    def test_driver_free_abi_files_require_reviewed_hashes_and_export_exactly(self):
+        added = {"scripts/ci/rusd_abi.py": "# pinned public ABI helper fixture\n",
+                 "scripts/ci/rusd-headers.json": '{"fixture":"pinned headers"}\n',
+                 "tests/test_ci_rusd_abi.py": "# pinned ABI test fixture\n"}
+        for name, content in added.items():
+            self.put(name, content)
+        commit = self.commit()
+        approval = self.approve(commit, {name: "Reviewed driver-free ABI check" for name in added})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        self.export(commit, approval)
+        for name in added:
+            self.assertEqual((self.output / name).read_bytes(), self.git("show", commit + ":" + name))
 
     def test_exports_only_approved_commit_blobs_and_modes(self):
         manifest = self.export()
@@ -199,6 +429,65 @@ class PublicExportTests(unittest.TestCase):
         self.put("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.2.8"\nrepository = "https://github.com/cryptolabsza/dc-exporter-rs-public"\n')
         commit = self.commit()
         self.rejected(lambda: self.export(commit, self.approve(commit, {"Cargo.toml": "public repository URL"})))
+
+    def vm_cargo_manifests(self):
+        # Exercise the maintained real manifest's exact reviewed dependency block.
+        # These scratch exports provide no Cargo build or dependency-licence proof.
+        after = (SCRIPT.parent.parent / "Cargo.toml").read_text()
+        addition = '\n# Strict libvirt XML parsing; encoding/transcoding and entity resolvers disabled.\nquick-xml = { version = "=0.42.0", default-features = false }\n'
+        self.assertEqual(after.count(addition), 1)
+        return after.replace(addition, "", 1), after
+
+    def test_cargo_exact_vm_parser_addition_requires_reviewed_reason_and_hash(self):
+        before, after = self.vm_cargo_manifests()
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        self.put("Cargo.toml", after)
+        commit = self.commit()
+        approval = self.approve(commit, {"Cargo.toml": "Reviewed pinned VM XML parser addition"})
+        self.rejected(lambda: self.export(commit, self.approve(commit)))
+        for field, value in [("sha256", "0" * 64), ("mode", "100755")]:
+            wrong = copy.deepcopy(approval)
+            wrong["files"]["Cargo.toml"][field] = value
+            self.rejected(lambda: self.export(commit, wrong))
+        self.export(commit, approval)
+        self.assertEqual((self.output / "Cargo.toml").read_text(), after)
+
+    def test_cargo_vm_addition_can_accompany_existing_repository_url_sanitization(self):
+        before, after = self.vm_cargo_manifests()
+        before = before.replace('repository = "https://github.com/cryptolabsza/dc-exporter-rs-public"',
+                                'repository = "https://github.com/example/private-fixture"')
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        self.put("Cargo.toml", after)
+        commit = self.commit()
+        self.export(commit, self.approve(commit, {"Cargo.toml": "Reviewed exact parser and public repository URL"}))
+        self.assertEqual((self.output / "Cargo.toml").read_text(), after)
+
+    def test_cargo_vm_exception_rejects_every_other_manifest_change(self):
+        before, after = self.vm_cargo_manifests()
+        self.put("Cargo.toml", before)
+        self.baseline = self.commit()
+        version = tomllib.loads(after)["package"]["version"]
+        changed_version = "9999.0.0" if version != "9999.0.0" else "9999.0.1"
+        version_case = after.replace(f'version = "{version}"', f'version = "{changed_version}"', 1)
+        self.assertNotEqual(version_case, after, "package-version rejection fixture must change the manifest")
+        cases = [version_case,
+                 after.replace('"=0.42.0"', '"=0.42.1"'),
+                 after.replace('default-features = false', 'default-features = true'),
+                 after.replace('default-features = false', 'default-features = false, features = ["encoding"]'),
+                 after.replace('quick-xml = ', 'arbitrary-parser = '),
+                 after.replace('serde_json = "1"', 'serde_json = "2"'),
+                 after.replace('lto = true', 'lto = false'),
+                 after.replace('strip = true', 'strip = false'),
+                 after + '\n[features]\ndefault = ["unexpected"]\n',
+                 after.replace('version = "=0.42.0"', 'version = "=0.42.0", optional = true')]
+        for index, changed in enumerate(cases):
+            with self.subTest(case=index):
+                self.put("Cargo.toml", changed)
+                commit = self.commit()
+                self.rejected(lambda: self.export(commit, self.approve(commit, {"Cargo.toml": "A reason cannot expand exact parser policy"})))
+                self.git("reset", "--hard", self.baseline)
 
     def test_rejects_approved_hash_or_mode_mismatch(self):
         for field, value in (("sha256", "0" * 64), ("mode", "100755")):

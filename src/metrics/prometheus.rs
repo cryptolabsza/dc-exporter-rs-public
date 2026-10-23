@@ -3,6 +3,8 @@
 //! Formats collected metrics in Prometheus exposition format.
 //! Uses DCXP_ prefix for unique metrics to distinguish from DCGM.
 
+// TRACEWEAVER: file-role=vm-health-preserving-formatter; req=VM-FIX-004,VM-FIX-006; trace=TRACE-VM-004,TRACE-VM-006; ver=VER-VM-004,VER-VM-006
+
 use super::collector::count_usable_gpus;
 use super::{AllMetrics, GpuMetrics, MetricSource};
 use crate::state::GpuState;
@@ -67,6 +69,15 @@ impl PrometheusFormatter {
         // DCXP metric headers
         Self::write_metric_headers(&mut output);
 
+        // Unjoined diagnostics retain available identity without physical GPU rows.
+        let mut recovery_identities=std::collections::HashSet::new();
+        for unmatched in &metrics.nvml_unmatched_errors {
+            let labels=format!("gpu=\"{}\",UUID=\"{}\",pci_bus_id=\"{}\",device=\"nvidia{}\",modelName=\"{}\",Hostname=\"{}\",DCXP_FI_DRIVER_VERSION=\"{}\"",unmatched.index,unmatched.uuid,unmatched.pci_bus_id,unmatched.index,unmatched.name,metrics.hostname,unmatched.driver_version);
+            Self::format_query_error(&mut output,&labels,&unmatched.error);
+            if unmatched.recovery.is_some() && recovery_identities.insert((unmatched.index,unmatched.uuid.as_str(),unmatched.pci_bus_id.as_str())) {
+                Self::format_recovery_diagnostics(&mut output,unmatched.recovery.as_ref(),&labels);
+            }
+        }
         // Per-GPU metrics
         for gpu in &metrics.gpus {
             Self::format_gpu_metrics(&mut output, gpu, &metrics.hostname);
@@ -86,6 +97,14 @@ impl PrometheusFormatter {
     }
 
     fn write_metric_headers(output: &mut String) {
+        for (name,help) in [
+            ("DCXP_GPU_RECOVERY_ACTION","Current exact native recovery action code; action is a fixed interpretation, not a physical defect diagnosis."),
+            ("DCXP_GPU_RECOVERY_ACTION_STATUS","Current native recovery field coverage and validity."),
+            ("DCXP_GPU_NVML_ERROR","Current bounded typed query error; unmatched device_by_index gpu/device labels are enumeration context only, UUID/BDF empty."),
+            ("DCXP_GPU_XID_CODE","Occurrences by numeric Xid in current source snapshot, at most64 distinct codes per GPU."),
+            ("DCXP_GPU_XID_SOURCE_STATUS","Selected kernel-log read coverage; valid does not establish complete history."),
+            ("DCXP_GPU_XID_CODES_TRUNCATED","Whether more than64 distinct current Xid codes were observed for this GPU."),
+        ] {output.push_str(&format!("# HELP {} {}\n# TYPE {} gauge\n",name,help,name));}
         // DCXP unique metrics
         output.push_str("# HELP DCXP_FI_DEV_VRAM_TEMP VRAM temperature (in C). 0 if not supported or VM passthrough.\n");
         output.push_str("# TYPE DCXP_FI_DEV_VRAM_TEMP gauge\n");
@@ -178,6 +197,33 @@ impl PrometheusFormatter {
         output.push('\n');
     }
 
+    fn format_health_diagnostics(output:&mut String,gpu:&GpuMetrics,labels:&str) {
+        Self::format_recovery_diagnostics(output,gpu.recovery.as_ref(),labels);
+        for error in &gpu.nvml_errors {Self::format_query_error(output,labels,error);}
+        let mut codes=std::collections::BTreeMap::<u32,u32>::new();
+        for code in &gpu.xid_errors {let count=codes.entry(*code).or_default();*count=count.saturating_add(1);}
+        let truncated=codes.len()>64;
+        for (code,count) in codes.into_iter().take(64) {output.push_str(&format!("DCXP_GPU_XID_CODE{{{},code=\"{}\"}} {}\n",labels,code,count));}
+        let source=match gpu.xid_source {Some(super::dmesg::DmesgSource::FlaggedDmesg)=>"flagged_dmesg",Some(super::dmesg::DmesgSource::PlainDmesg)=>"plain_dmesg",Some(super::dmesg::DmesgSource::KernLog)=>"kern_log",None=>"none"};
+        let status=if !gpu.xid_source_read_succeeded {"unavailable"}else if truncated {"truncated"}else{"valid"};
+        output.push_str(&format!("DCXP_GPU_XID_SOURCE_STATUS{{{},source=\"{}\",status=\"{}\"}} 1\n",labels,source,status));
+        output.push_str(&format!("DCXP_GPU_XID_CODES_TRUNCATED{{{}}} {}\n",labels,u8::from(truncated)));
+    }
+    fn format_recovery_diagnostics(output:&mut String,recovery:Option<&super::gpu::RecoveryObservation>,labels:&str) {
+        if let Some(recovery)=recovery {
+            output.push_str(&format!("DCXP_GPU_RECOVERY_ACTION_STATUS{{{},status=\"{}\"}} 1\n",labels,recovery.status.as_str()));
+            if let Some(action)=recovery.action {
+                let interpretation=match action {0=>"none",1=>"gpu_reset",2=>"node_reboot",3=>"drain_p2p",4=>"drain_and_reset",5=>"recover_imex_domain",6=>"bus_reset",7=>"system_reboot",_=>"unknown"};
+                output.push_str(&format!("DCXP_GPU_RECOVERY_ACTION{{{},action=\"{}\"}} {}\n",labels,interpretation,action));
+            }
+        }
+    }
+    fn format_query_error(output:&mut String,labels:&str,error:&super::gpu::NvmlQueryError) {
+        let code=error.code.map(|code|code.to_string()).unwrap_or_else(||"unknown".into());
+        output.push_str(&format!("DCXP_GPU_NVML_ERROR{{{},query=\"{}\",error=\"{}\",code=\"{}\"}} 1\n",labels,error.query,error.error,code));
+    }
+
+    // TRACEWEAVER: entrypoint=format_gpu_metrics; req=VM-FIX-004,VM-FIX-006; trace=TRACE-VM-004,TRACE-VM-006; ver=VER-VM-004,VER-VM-006
     fn format_gpu_metrics(output: &mut String, gpu: &GpuMetrics, hostname: &str) {
         // Common labels
         let dcxp_labels = format!(
@@ -198,8 +244,8 @@ impl PrometheusFormatter {
             MetricSource::Pci => ",source=\"pci\"",
         };
         
-        // For VM metrics, update the state to OK (we have data)
-        let effective_state = if gpu.source == MetricSource::Vm {
+        // Preserve legacy guest passthrough compatibility without clearing current faults.
+        let effective_state = if gpu.source == MetricSource::Vm && gpu.state == GpuState::VmPassthrough {
             GpuState::Ok
         } else {
             gpu.state
@@ -210,6 +256,8 @@ impl PrometheusFormatter {
         let operational_metrics_valid = matches!(effective_state, GpuState::Ok | GpuState::Warning)
             && !gpu.nvml_essential_query_failed;
 
+        // Diagnostic evidence is retained even when operational telemetry is invalid.
+        Self::format_health_diagnostics(output,gpu,&dcxp_labels);
         // DCXP unique metrics
         if operational_metrics_valid {
             output.push_str(&format!(
@@ -768,4 +816,195 @@ mod tests {
             }
         }
     }
+
+    // TRACEWEAVER: verification=vm_formatter_current_faults_preserve_health_and_suppress_stale_values; req=VM-FIX-004,VM-FIX-006; trace=TRACE-VM-004,TRACE-VM-006; ver=VER-VM-004,VER-VM-006
+    #[test]
+    fn vm_formatter_current_faults_preserve_health_and_suppress_stale_values() {
+        for (state, expected) in [
+            (GpuState::HardwareFailure, 5),
+            (GpuState::Error, 2),
+            (GpuState::Unavailable, 0),
+        ] {
+            let uuid = format!("GPU-VM-{state:?}");
+            let output = PrometheusFormatter::format(&AllMetrics {
+                hostname: "vm-health-fixture".into(),
+                gpus: vec![GpuMetrics {
+                    index: 3,
+                    name: "Guest GPU".into(),
+                    uuid: uuid.clone(),
+                    pci_bus_id: "0000:23:00.0".into(),
+                    driver_version: "fixture-driver".into(),
+                    state,
+                    source: MetricSource::Vm,
+                    // Deliberately stale values: the formatter must enforce health itself.
+                    gpu_temp: Some(58),
+                    vram_temp: Some(72),
+                    hotspot_temp: Some(80),
+                    power_usage: Some(530.377),
+                    power_limit: Some(575.0),
+                    sm_clock: Some(2_400),
+                    mem_clock: Some(10_000),
+                    gpu_util: Some(98),
+                    mem_util: Some(83),
+                    encoder_util: Some(77),
+                    decoder_util: Some(66),
+                    fb_used: Some(31_000),
+                    fb_free: Some(1_000),
+                    fan_speed: Some(75),
+                    pcie_gen: Some(5),
+                    pcie_width: Some(16),
+                    pcie_tx_throughput: Some(100),
+                    pcie_rx_throughput: Some(200),
+                    ecc_enabled: true,
+                    ecc_sbe: Some(3),
+                    ecc_dbe: Some(4),
+                    nvlink_active: 1,
+                    nvlink_tx_throughput: Some(300),
+                    nvlink_rx_throughput: Some(400),
+                    nvlink_errors: 2,
+                    compute_processes: 2,
+                    graphics_processes: 1,
+                    throttle_reasons: ThrottleReasons {
+                        hw_thermal_slowdown: true,
+                        ..Default::default()
+                    },
+                    aer_errors: 7,
+                    hardware_failure_reason: Some("current host fault".into()),
+                    dmesg_rm_init_failed: 2,
+                    fallen_off_bus: true,
+                    xid_errors: vec![79],
+                    xid_source: Some(super::super::dmesg::DmesgSource::FlaggedDmesg),
+                    xid_source_read_succeeded: true,
+                    recovery: Some(super::super::gpu::RecoveryObservation {
+                        action: Some(1),
+                        status: super::super::gpu::RecoveryStatus::Valid,
+                        error: None,
+                    }),
+                    nvml_errors: vec![super::super::gpu::NvmlQueryError {
+                        query: "power_usage", error: "gpu_lost", code: Some(15),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+
+            for metric in ["DCXP_GPU_STATE", "GPU_ERROR_STATE"] {
+                let sample = output.lines().find(|line| {
+                    line.starts_with(&format!("{metric}{{")) && line.contains(&uuid)
+                }).unwrap();
+                assert!(sample.ends_with(&format!("}} {expected}")), "{state:?}: {sample}");
+                for identity in ["pci_bus_id=\"0000:23:00.0\"", "Hostname=\"vm-health-fixture\""] {
+                    assert!(sample.contains(identity), "lost VM identity: {sample}");
+                }
+            }
+            for (metric, suffix) in [
+                ("DCXP_FI_DEV_VRAM_TEMP_VALID", " 0"),
+                ("DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO", " 1"),
+            ] {
+                assert!(output.lines().any(|line| line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&uuid) && line.contains("source=\"vm\"")
+                    && line.ends_with(suffix)), "lost VM source/validity for {state:?}: {metric}");
+            }
+            for (metric, label, value) in [
+                ("DCXP_GPU_HW_FAILURE", "failure_reason=\"current host fault\"", if expected == 5 { 1 } else { 0 }),
+                ("DCXP_GPU_DMESG_RM_INIT_FAILED", "pci_bus_id=\"0000:23:00.0\"", 2),
+                ("DCXP_GPU_FALLEN_OFF_BUS", "pci_bus_id=\"0000:23:00.0\"", 1),
+                ("DCXP_AER_TOTAL_ERRORS", "pci_bus_id=\"0000:23:00.0\"", 7),
+                ("DCXP_GPU_XID_ERRORS", "pci_bus_id=\"0000:23:00.0\"", 1),
+                ("DCXP_GPU_XID_CODE", "code=\"79\"", 1),
+                ("DCXP_GPU_XID_SOURCE_STATUS", "source=\"flagged_dmesg\",status=\"valid\"", 1),
+                ("DCXP_GPU_RECOVERY_ACTION", "action=\"gpu_reset\"", 1),
+                ("DCXP_GPU_NVML_ERROR", "query=\"power_usage\",error=\"gpu_lost\",code=\"15\"", 1),
+            ] {
+                assert!(output.lines().any(|line| line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&uuid) && line.contains(label)
+                    && line.ends_with(&format!("}} {value}"))), "lost {metric} diagnostic for {state:?}");
+            }
+            for line in output.lines().filter(|line| line.contains(&uuid)) {
+                let operational = line.starts_with("DCGM_FI_DEV_")
+                    || line.starts_with("DCXP_GPU_SUPPORTED{")
+                    || (line.starts_with("DCXP_FI_DEV_")
+                        && !line.starts_with("DCXP_FI_DEV_VRAM_TEMP_VALID{")
+                        && !line.starts_with("DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO{"));
+                assert!(!operational, "{state:?} exported stale operational sample: {line}");
+            }
+        }
+    }
+
+    // TRACEWEAVER: verification=vm_formatter_nominal_and_legacy_passthrough_remain_compatible; req=VM-FIX-006; trace=TRACE-VM-006; ver=VER-VM-006
+    #[test]
+    fn vm_formatter_nominal_and_legacy_passthrough_remain_compatible() {
+        for state in [GpuState::Ok, GpuState::Warning, GpuState::VmPassthrough] {
+            let uuid = format!("GPU-VM-NOMINAL-{state:?}");
+            let output = PrometheusFormatter::format(&AllMetrics {
+                gpus: vec![GpuMetrics {
+                    uuid: uuid.clone(),
+                    state,
+                    source: MetricSource::Vm,
+                    gpu_temp: Some(58),
+                    vram_temp: Some(72),
+                    hotspot_temp: Some(80),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            for (metric, value) in [
+                ("DCXP_GPU_STATE", 1), ("GPU_ERROR_STATE", 1),
+                ("DCXP_FI_DEV_VRAM_TEMP", 72), ("DCGM_FI_DEV_GPU_TEMP", 58),
+                ("DCGM_FI_DEV_HOT_SPOT_TEMP", 80), ("DCXP_FI_DEV_VRAM_TEMP_VALID", 1),
+            ] {
+                assert!(output.lines().any(|line| line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&uuid) && line.ends_with(&format!("}} {value}"))),
+                    "{state:?} lost compatible {metric} value {value}");
+            }
+            assert!(output.lines().any(|line| line.starts_with("DCXP_FI_DEV_VRAM_TEMP{")
+                && line.contains(&uuid) && line.contains("source=\"vm\"")));
+        }
+    }
+
+    // VER-HEALTH-005: exact new snapshot contract against production formatter.
+    #[test]
+    fn health_definition_numeric_xid_gauges_survive_fault_telemetry_suppression() {
+        let metrics=AllMetrics {hostname:"fixture-host".into(),gpus:vec![GpuMetrics {
+            uuid:"GPU-SYNTHETIC".into(),pci_bus_id:"0000:61:00.0".into(),
+            state:GpuState::Error,xid_errors:vec![109,119,154,154],..Default::default()
+        }],..Default::default()};
+        let first=PrometheusFormatter::format(&metrics);
+        let second=PrometheusFormatter::format(&metrics);
+        assert_eq!(first,second);
+        assert!(first.contains("# TYPE DCXP_GPU_XID_CODE gauge\n"));
+        for (code,count) in [(109,1),(119,1),(154,2)] {
+            let samples:Vec<_>=first.lines().filter(|line|line.starts_with("DCXP_GPU_XID_CODE{") && line.contains(&format!("code=\"{code}\""))).collect();
+            assert_eq!(samples.len(),1,"{code}");
+            assert!(samples[0].ends_with(&format!(" {count}")));
+            assert!(samples[0].contains("UUID=\"GPU-SYNTHETIC\""));
+        }
+        assert!(!has_sample(&first,"DCGM_FI_DEV_POWER_USAGE","GPU-SYNTHETIC"));
+    }
+
+    #[test]
+    fn health_definition_xid_cardinality_is_64_with_explicit_truncation() {
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:vec![GpuMetrics {
+            uuid:"GPU-SYNTHETIC".into(),xid_errors:(1..=65).collect(),..Default::default()
+        }],..Default::default()});
+        assert_eq!(output.lines().filter(|line|line.starts_with("DCXP_GPU_XID_CODE{")).count(),64);
+        assert!(output.lines().any(|line|line.starts_with("DCXP_GPU_XID_CODES_TRUNCATED{") && line.ends_with(" 1")));
+    }
+
+// VER-HEALTH-005: exact additive action/status/error samples from actual adapter.
+    #[test]
+    fn health_definition_future_formatter_retains_diagnostics_without_operational_values() {
+        let _guard=crate::metrics::gpu::tests::health_definition_fixture_lock();
+        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+        std::env::set_var("DCXP_FIXTURE_RECOVERY","1");std::env::set_var("DCXP_FIXTURE_QUERY","power_usage");std::env::set_var("DCXP_FIXTURE_ERROR","15");
+        let context=crate::metrics::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let gpu=crate::metrics::gpu::collect_metrics_from_nvml(&context).gpus.remove(3);
+        let output=PrometheusFormatter::format(&AllMetrics {hostname:"fixture-host".into(),gpus:vec![gpu],..Default::default()});
+        for metric in ["DCXP_GPU_RECOVERY_ACTION","DCXP_GPU_RECOVERY_ACTION_STATUS","DCXP_GPU_NVML_ERROR"] {assert!(output.contains(&format!("# TYPE {metric} gauge\n")));}
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION{") && l.contains("action=\"gpu_reset\"") && l.ends_with(" 1")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION_STATUS{") && l.contains("status=\"valid\"") && l.ends_with(" 1")));
+        assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_NVML_ERROR{") && l.contains("query=\"power_usage\"") && l.contains("error=\"gpu_lost\"") && l.contains("code=\"15\"") && l.ends_with(" 1")));
+        assert!(!has_sample(&output,"DCGM_FI_DEV_POWER_USAGE","GPU-SYNTHETIC-3"));
+    }
+
 }

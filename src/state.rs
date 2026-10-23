@@ -240,4 +240,15 @@ mod tests {
         assert!(!reasons.applications_clocks_setting);
         assert!(reasons.sw_power_cap);
     }
+
+    // VER-HEALTH-006: scalar compatibility is a GREEN constraint, not fabricated RED.
+    #[test]
+    fn health_definition_legacy_numeric_contract_is_unchanged() {
+        for (state, expected) in [(GpuState::Unavailable,0),(GpuState::Ok,1),
+            (GpuState::Warning,1),(GpuState::Error,2),(GpuState::VmPassthrough,3),
+            (GpuState::HardwareFailure,5)] {
+            assert_eq!(state.as_u8(),expected);
+        }
+    }
+
 }

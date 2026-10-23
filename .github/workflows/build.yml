@@ -1,4 +1,4 @@
-# TRACEWEAVER: file-role=native-offline-ci; req=REQ-PUB-003; trace=TRACE-PUB-003; ver=VER-PUB-003
+# TRACEWEAVER: file-role=pool-build-caller; req=REQ-PUB-003; trace=TRACE-PUB-003; ver=VER-PUB-003
 name: CI
 on:
   push:
@@ -15,43 +15,8 @@ jobs:
       github.repository == 'cryptolabsza/dc-exporter-rs-public' &&
       github.repository_id == '1416116330' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref_protected &&
       (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
-    runs-on:
-      group: dc-exporter-build
-      labels: dc-exporter-build
-    timeout-minutes: 30
-    env:
-      CARGO_TERM_COLOR: never
-      ARTIFACT_NAME: dc-exporter-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-    steps:
-      - name: Checkout exact trusted source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          path: source-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Native offline tests and build
-        id: build
-        working-directory: source-${{ github.run_id }}-${{ github.run_attempt }}
-        shell: bash
-        run: bash scripts/ci/build.sh
-      - name: Upload exact run artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: dc-exporter-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: ${{ steps.build.outputs.artifact_dir }}/*
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-      - name: Clean owned attempt artifact
-        if: always()
-        env:
-          ARTIFACT_DIR: ${{ steps.build.outputs.artifact_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "$ARTIFACT_DIR" ]]; then
-            [[ "$ARTIFACT_DIR" == "$RUNNER_TEMP"/dc-exporter-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.??????/dist ]]
-            [[ -d "$ARTIFACT_DIR" && ! -L "$ARTIFACT_DIR" && -O "$ARTIFACT_DIR" ]]
-            rm -rf -- "${ARTIFACT_DIR%/dist}"
-          fi
+    uses: cryptolabsza/dc-exporter-rs-public/.github/workflows/ci-pool-build-recipe.yml@2f244af42194755a1cce857742d2efae0d4331b5
+    permissions:
+      contents: read

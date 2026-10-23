@@ -112,6 +112,77 @@ fn optional_rusd_requires_current_healthy_bound_host_and_exact_candidate() {
     assert!(!eligible_for_rusd(&g));
 }
 
+// REQ-THERMAL-003/005/009: profile selection cannot bypass host eligibility.
+#[test]
+fn exact_615_candidate_retains_590_595_and_every_current_host_gate() {
+    for driver in ["590.48.01", "595.99.02", "615.71.09"] {
+        let mut gpu = healthy("0000:23:00.0", "GPU-A");
+        gpu.driver_version = driver.into();
+        assert!(eligible_for_rusd(&gpu), "{driver}");
+        gpu.state = GpuState::Warning;
+        assert!(eligible_for_rusd(&gpu), "{driver}");
+        gpu.state = GpuState::Ok;
+        let mut rejected = Vec::new();
+        for state in [
+            GpuState::Error,
+            GpuState::Unavailable,
+            GpuState::HardwareFailure,
+            GpuState::VmPassthrough,
+        ] {
+            let mut g = gpu.clone();
+            g.state = state;
+            rejected.push(g);
+        }
+        let mut g = gpu.clone();
+        g.nvml_essential_query_failed = true;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.fallen_off_bus = true;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.dmesg_hardware_failure = true;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.source = MetricSource::Vm;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.bound_driver = None;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.bound_driver = Some("vfio-pci".into());
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.device_id = 0x2684;
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.uuid.clear();
+        rejected.push(g);
+        let mut g = gpu.clone();
+        g.pci_bus_id = "23:00.0".into();
+        rejected.push(g);
+        for (index, g) in rejected.iter().enumerate() {
+            assert!(!eligible_for_rusd(g), "{driver}/gate {index}");
+        }
+    }
+    for driver in [
+        "595.99.01",
+        "595.99.03",
+        "595.99.02-open",
+        "595.99.02 ",
+        "600.00.00",
+        "615.71.08",
+        "615.71.10",
+        "615.71.09-open",
+        "615.71.09 ",
+        "615.78.08",
+        "999.00.00",
+    ] {
+        let mut gpu = healthy("0000:23:00.0", "GPU-A");
+        gpu.driver_version = driver.into();
+        assert!(!eligible_for_rusd(&gpu), "{driver}");
+    }
+}
+
 #[test]
 fn reordered_current_results_join_by_bdf_and_uuid_and_leave_nvml_fields_unchanged() {
     let mut gpus = vec![

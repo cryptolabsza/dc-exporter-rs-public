@@ -14,7 +14,7 @@ work="$(mktemp -d "$RUNNER_TEMP/dc-exporter-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMP
 success=false
 # TRACEWEAVER: entrypoint=cleanup; req=REQ-PUB-003; trace=TRACE-PUB-003; ver=VER-PUB-003
 cleanup() {
-  rm -rf -- "$work/target" "$work/cargo" "$work/package"
+  rm -rf -- "$work/target" "$work/cargo" "$work/package" "$work/rusd-abi"
   if [[ "$success" != true ]]; then rm -rf -- "$work"; fi
 }
 trap cleanup EXIT
@@ -25,6 +25,7 @@ ulimit -u 256
 ulimit -f 1048576
 /usr/bin/python3 -m unittest discover -s tests -p 'test_ci_*.py'
 /usr/bin/python3 -m unittest discover -s tests -p 'test_public_export.py'
+/usr/bin/python3 scripts/ci/rusd_abi.py --cache "$work/rusd-abi"
 cargo test --release --locked --all-targets -- --skip test_collector_creation --skip test_timeout_behavior
 cargo build --release --locked
 strip "$CARGO_TARGET_DIR/release/dc-exporter"

@@ -1,6 +1,6 @@
 [package]
 name = "dc-exporter"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2021"
 authors = ["CryptoLabs ZA"]
 description = "GPU metrics exporter for Prometheus - VRAM temp, hotspot temp, throttle reasons"
@@ -58,6 +58,9 @@ base64 = "0.22"
 
 # JSON parsing for VM metrics
 serde_json = "1"
+
+# Strict libvirt XML parsing; encoding/transcoding and entity resolvers disabled.
+quick-xml = { version = "=0.42.0", default-features = false }
 
 [profile.release]
 opt-level = 3

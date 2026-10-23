@@ -114,6 +114,13 @@ pub struct GpuMetrics {
     // AER errors (PCIe)
     pub aer_errors: u32,
     
+    /// Current native recovery evidence and bounded typed query errors.
+    pub recovery: Option<gpu::RecoveryObservation>,
+    pub nvml_errors: Vec<gpu::NvmlQueryError>,
+    /// Selected kernel-log snapshot coverage, independent of active health.
+    pub xid_source: Option<dmesg::DmesgSource>,
+    pub xid_source_read_succeeded: bool,
+
     // Hardware failure detection
     /// Reason for hardware failure (dmesg, /proc health, etc.)
     pub hardware_failure_reason: Option<String>,
@@ -192,6 +199,9 @@ pub struct AllMetrics {
     /// Individual GPU metrics
     pub gpus: Vec<GpuMetrics>,
     
+    /// Device-handle failures have no verified GPU identity; never index-join them.
+    pub nvml_unmatched_errors: Vec<gpu::UnmatchedNvmlError>,
+
     /// APT upgradable packages count
     pub apt_upgradable: Option<u32>,
     

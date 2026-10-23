@@ -87,5 +87,35 @@ class BuildBoundaryTests(unittest.TestCase):
             self.ci.make_manifest(pathlib.Path(tmp), repository='cryptolabsza/dc-exporter-rs-public', repository_id=1416116330, sha='a' * 40, ref='refs/heads/dev', run_id=10, run_attempt=2, artifact_name='dc-exporter-1416116330-10-2-' + 'a' * 40, cargo_version='0.2.7', binary_version='0.2.8')
 
 
+class RUSDIntegrationTests(unittest.TestCase):
+    def test_shared_pool_retains_native_guards_and_builds_without_gpu_execution(self):
+        source = (ROOT / 'scripts/ci/pool-build.sh').read_text()
+        check = 'python3 scripts/ci/rusd_abi.py --cache /tmp/rusd-abi'
+        self.assertEqual(source.count(check), 1)
+        self.assertLess(source.index(check), source.index('cargo metadata --locked'))
+        self.assertLess(source.index(check), source.index('cargo test --release'))
+        self.assertIn('--skip test_collector_creation --skip test_timeout_behavior', source)
+        self.assertEqual(source.count('--skip '), 2)
+        for forbidden in ['--one-shot', '--ignored', '--privileged', '--device', '/var/run/docker.sock', '--network=host']:
+            self.assertNotIn(forbidden, source)
+
+    def test_build_checks_pinned_abi_after_unit_tests_before_cargo(self):
+        source = (ROOT / 'scripts/ci/build.sh').read_text()
+        check = '/usr/bin/python3 scripts/ci/rusd_abi.py --cache "$work/rusd-abi"'
+        self.assertEqual(source.count(check), 1)
+        self.assertLess(source.index("-p 'test_ci_*.py'"), source.index(check))
+        self.assertLess(source.index("-p 'test_public_export.py'"), source.index(check))
+        self.assertLess(source.index(check), source.index('cargo test --release'))
+
+    def test_build_cleanup_removes_only_owned_work_caches(self):
+        source = (ROOT / 'scripts/ci/build.sh').read_text()
+        cleanup = source.split('cleanup() {', 1)[1].split('}', 1)[0]
+        removals = [line.strip() for line in cleanup.splitlines() if line.strip().startswith('rm -rf --')]
+        self.assertEqual(removals, [
+            'rm -rf -- "$work/target" "$work/cargo" "$work/package" "$work/rusd-abi"',
+        ])
+        self.assertIn('if [[ "$success" != true ]]; then rm -rf -- "$work"; fi', cleanup)
+
+
 if __name__ == '__main__':
     unittest.main()
