@@ -21,7 +21,7 @@ jobs:
     runs-on:
       group: ${{ toJSON(github.event.repository.private) == 'true' && 'ci-build-ephemeral' || 'ci-build-public-ephemeral' }}
       labels: ci-linux-cpu-v1-r1416116330
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - name: Checkout exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
