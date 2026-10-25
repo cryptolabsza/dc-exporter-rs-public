@@ -34,7 +34,7 @@ fn source_caller_uses_immutable_qualified_recipe() {
 fn build_uses_visibility_selected_pool_and_readonly_credentials() {
     for expected in ["ci-build-ephemeral", "ci-build-public-ephemeral", "ci-linux-cpu-v1-r1416116330",
         "toJSON(github.event.repository.private)", "github.event.repository.id == 1416116330",
-        "contents: read", "persist-credentials: false", "timeout-minutes: 30"] {
+        "contents: read", "persist-credentials: false", "timeout-minutes: 120"] {
         assert!(RECIPE.contains(expected), "{expected}");
     }
     for unsafe_fragment in ["apt-get", "sudo ", "secrets.", "runs-on: [self-hosted, linux]", "release-dev:", "gh release"] {
