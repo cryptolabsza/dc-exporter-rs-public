@@ -17,6 +17,6 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref_protected &&
       (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
-    uses: cryptolabsza/dc-exporter-rs-public/.github/workflows/ci-pool-build-recipe.yml@2f244af42194755a1cce857742d2efae0d4331b5
+    uses: cryptolabsza/dc-exporter-rs-public/.github/workflows/ci-pool-build-recipe.yml@1948541081a3a62e0a127fde245399257d8c0ca1
     permissions:
       contents: read

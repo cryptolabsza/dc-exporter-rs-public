@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "authority": "Direct owner instruction, 2026-10-25: all build CI should have 120 minute cap",
+  "supersedes": "Earlier build/test/scan job timeout limits only; historical migration and review receipts remain unchanged",
+  "timeout_minutes": 120,
+  "repository": "cryptolabsza/dc-exporter-rs-public",
+  "repository_id": 1416116330,
+  "source_head": "a7c9c89704a3a4501638d52675174051bd33b5b0",
+  "recipe_commit": "1948541081a3a62e0a127fde245399257d8c0ca1",
+  "recipe_sha256": {
+    ".github/workflows/ci-pool-build-recipe.yml": "1a729f561449ca6313778c2ca85230e26e8fc416572d6ccc421f375f46e48975"
+  },
+  "publication_status": "local signed source; admission, caller publication and native acceptance pending",
+  "publisher_recipe_commit": null,
+  "publisher_helpers": [],
+  "branch_role": "CI-only main hotfix candidate; no application release or version bump"
+}
