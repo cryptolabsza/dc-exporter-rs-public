@@ -88,7 +88,7 @@ struct Args {
     #[arg(long)]
     no_register_access: bool,
 
-    /// VRAM thermal method (default: legacy; auto/rusd remain experimental)
+    /// VRAM thermal method (default: auto; exact RUSD profiles remain experimental)
     #[arg(long, value_enum)]
     vram_backend: Option<ThermalBackend>,
 

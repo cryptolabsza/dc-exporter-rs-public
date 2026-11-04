@@ -2,6 +2,51 @@
 
 The exporter collects the current NVIDIA GPU recovery action and typed NVML query errors independently of operational measurements. A GPU can return its name, temperature and memory capacity while still requiring recovery. Successful later queries do not restore OK within that collection.
 
+## Host NVML collection status
+
+`DCXP_NVML_COLLECTION_STATUS{Hostname,status}` is a host snapshot gauge,
+independent of per-device recovery/query diagnostics. Each snapshot emits all
+six statuses below as `0` or `1`, with exactly one value set to `1`.
+
+| Status | Meaning |
+|---|---|
+| `success` | Current device enumeration succeeded, including a valid count of zero; individual device queries can still fail. |
+| `library_load_error` | Neither library candidate could be opened. |
+| `initialization_error` | A provider opened but initialization or a required symbol failed. |
+| `enumeration_error` | The initialized provider failed to enumerate devices. |
+| `timeout` | The current collection exceeded its bounded worker deadline. |
+| `worker_unavailable` | The collection worker could not be reached or its reply channel disconnected. |
+
+Status describes the current result. A later success clears the earlier
+failure value; it is not an “ever initialized” flag. A successfully retried
+context stays owned by the worker until shutdown. The status labels are finite:
+raw exceptions, paths and invented device identities are never labels.
+
+Global collection failure can coexist with eight PCI-discovered devices,
+NVML=0 and usable=0. Unavailable PCI fallback rows retain generic Error `2`
+unless stronger evidence applies; they do not become HardwareFailure `5` or
+fabricated healthy telemetry. Existing terminal-hardware evidence and explicit
+passthrough classification retain their precedence. A zero
+`DCXP_GPU_AVAILABLE` means no current NVML or VM GPU records were returned;
+usable counts and health are separate. Host collection `success` does not certify each GPU as healthy.
+
+### Runtime library diagnostics
+
+On Linux, the GPU and optional thermal paths prefer `libnvidia-ml.so.1` and
+try legacy `libnvidia-ml.so` only after an opening failure. Missing files, bad
+ELF, missing dependencies and loader permission errors all permit this fallback.
+A failed preferred opening followed by legacy selection logs a warning; if
+both fail, both candidate diagnostics remain in the error. Once a provider
+opens, native initialization errors and required-symbol errors retain their
+category and do not trigger selection of another provider. Raw recovery calls
+retain exactly the same provider as their NVML context/device handles.
+
+The unversioned development symlink is not needed when the runtime SONAME is
+available. Inspect the reported load/initialization error and existing runtime
+library/device permissions; the exporter does not modify the environment or
+create/repair host symlinks. A missing filename is collection evidence, not a
+physical damage diagnosis.
+
 Existing dashboard state numbers remain unchanged:
 
 | GPU_ERROR_STATE | Meaning |

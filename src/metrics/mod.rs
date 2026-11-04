@@ -10,6 +10,7 @@
 pub mod collector;
 pub mod dmesg;
 pub mod gpu;
+mod nvml_loader;
 pub mod pci;
 pub mod prometheus;
 pub mod register;
@@ -18,7 +19,7 @@ pub mod nvidia_rm;
 pub mod thermal;
 pub mod thermal_worker;
 
-pub use gpu::NvmlCollectionResult;
+pub use gpu::{NvmlCollectionResult, NvmlCollectionStatus};
 pub use register::RegisterAccessStatus;
 
 use crate::state::{GpuArchitecture, GpuState, ThrottleReasons};
@@ -193,6 +194,9 @@ pub struct AllMetrics {
     /// Successfully constructed per-GPU NVML records for the current collection
     pub nvml_gpus: u32,
     
+    /// Current host collection outcome, independent of per-device health.
+    pub nvml_collection_status: NvmlCollectionStatus,
+
     /// Whether any GPUs are available to host
     pub gpus_available: bool,
     

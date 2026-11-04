@@ -15,7 +15,7 @@ workloads.
 
 **v0.3.0** is the versioned release line for this source history. Use its published
 artifacts with `BUILD_INFO.txt` identifying the exact accepted protected-main
-commit and verify their checksums. RTX 5090 RUSD remains opt-in and experimental;
+commit and verify their checksums. This development candidate uses automatic per-GPU thermal selection; RTX 5090 RUSD remains experimental;
 full hardware and live VM acceptance remain pending. Historical stable **0.2.8**
 downloads retain older provenance and were not built from this source history.
 
@@ -38,7 +38,7 @@ curl http://localhost:9835/metrics
 The default collection interval is 10 seconds and the HTTP listener binds all
 interfaces on port **9835**. Restrict access to trusted monitoring systems through
 your host's network policy. `--no-register-access` disables direct BAR register
-reads while preserving NVML telemetry and explicitly selected RUSD collection.
+reads while preserving NVML telemetry and eligible RUSD collection.
 For VM hosts, read the [guest-probing limits](#vm-passthrough) before collecting.
 
 For Prometheus running on the same host:
@@ -101,7 +101,12 @@ optional memory backend requires `/dev/mem` or a kernel-parameter change.
 
 ## Memory and hotspot temperatures
 
-The default memory policy is **`legacy`**. Sensor availability depends on the GPU,
+The default memory policy is **`auto`**. Each eligible host GPU prefers the official
+NVML memory-temperature field, then an exact supported RUSD profile, then an
+existing permitted measured legacy BAR reading. Each fallback requires an explicit
+unsupported result. This supports mixed A100/H100 and older RTX/Ada fleets without
+per-host GPU-family overrides. Forced `nvml` does not preserve memory readings on
+GPUs whose official field is unsupported. Sensor availability depends on the GPU,
 exact driver, permissions and backend. An unavailable temperature remains zero;
 always check its validity and status before treating it as a measurement.
 
@@ -114,10 +119,13 @@ always check its validity and status before treating it as a measurement.
 | `off` | Suppress memory-temperature collection, including guest readings. |
 
 Permission errors, device loss, invalid samples and stale samples stop fallback.
-The optional NVML/RUSD methods do not add hotspot support; `off` leaves core
-temperature and the existing hotspot policy in place.
+Official-first describes the selected memory output: existing legacy BAR memory
+and hotspot acquisition may run independently before selection. NVML/RUSD add no
+generic official hotspot sensor. Existing independent legacy hotspot readings are
+preserved; core or memory temperature is never substituted for hotspot. `off`
+leaves core temperature and the existing hotspot policy in place.
 
-**RTX 5090 RUSD is opt-in and experimental.** Its profiles are limited to Linux
+**RTX 5090 RUSD remains experimental and can be selected by default `auto`.** Its profiles are limited to Linux
 x86-64, PCI device **`0x2b85`**, and exact NVIDIA driver versions **`590.48.01`**,
 **`595.99.02`** or **`615.71.09`**. Adjacent, suffixed and unknown versions fail
 closed.
@@ -149,13 +157,15 @@ See [config.toml.example](config.toml.example).
 
 ```toml
 [thermal]
-vram_backend = "legacy"
+vram_backend = "auto"
 timeout_ms = 2000
 # max_sample_age_ms = 30000
 ```
 
 Explicit `--vram-backend`, `--thermal-timeout-ms` and
 `--thermal-max-sample-age-ms` override TOML in HTTP, one-shot and TUI modes.
+An explicit CLI or TOML backend (`legacy`, `nvml`, `rusd`, `off` or `auto`)
+remains authoritative; `auto` applies when no backend is configured.
 The default maximum sample age is the larger of three collection intervals and
 the thermal deadline.
 
@@ -179,6 +189,7 @@ clocks and other available NVIDIA telemetry alongside diagnostic metrics:
 | `DCXP_AER_TOTAL_ERRORS` | PCIe AER error observations. |
 | `DCXP_GPU_RECOVERY_ACTION`, `DCXP_GPU_RECOVERY_ACTION_STATUS` | Native recovery action and whether it is available and valid. |
 | `DCXP_GPU_NVML_ERROR` | Fixed query/error/code diagnostics for the current collection. |
+| `DCXP_NVML_COLLECTION_STATUS` | Current host NVML collection outcome; six finite, one-hot status values. |
 | `DCXP_GPU_XID_CODE`, `DCXP_GPU_XID_SOURCE_STATUS` | Numeric Xid observations and kernel-log read coverage. |
 | `dc_exporter_build_info` | Version, build timestamp and source hash. |
 
@@ -193,6 +204,36 @@ Recovery actions and Xids do not by themselves prove permanent damage. Numeric
 Xid gauges describe the currently read log snapshot, rather than a complete
 lifetime error history. See [GPU health diagnostics](docs/gpu-health.md) for
 status precedence, error labels and coverage limits.
+
+### NVML loading and collection troubleshooting
+
+On Linux, the exporter prefers the NVIDIA runtime SONAME
+`libnvidia-ml.so.1`; the unversioned development symlink `libnvidia-ml.so` is
+not required. If opening the runtime library fails, it tries the legacy name.
+Any opening failure permits this fallback, including a missing file, bad ELF,
+missing dependency or loader permission error. Legacy selection logs a warning;
+if neither opens, the error retains both candidate diagnostics. Once a library
+opens, native initialization and required-symbol errors stop selection and
+retain their original category. GPU and optional thermal collection use the
+same selection policy, and raw calls retain their selected provider.
+
+`DCXP_NVML_COLLECTION_STATUS{Hostname,status}` emits all six statuses on each
+snapshot: `success`, `library_load_error`, `initialization_error`,
+`enumeration_error`, `timeout` and `worker_unavailable`. Every value is `0` or
+`1`, with exactly one current status set to `1`; recovery clears the prior
+failure status. Successful enumeration of zero devices is `success`, and
+per-device query errors can coexist with host collection success. Check
+`DCXP_GPU_NVML_ERROR`, usable counts and existing GPU health separately.
+
+For example, PCI discovery can find eight GPUs while a global NVML loading
+failure yields NVML=0 and usable=0. The resulting generic Error `2` rows do not
+establish HardwareFailure `5`; independently confirmed terminal hardware
+evidence still takes precedence. A zero `DCXP_GPU_AVAILABLE` means no current
+NVML or VM GPU records were returned; usable counts and health are separate. The exporter
+retries unavailable initialization on later collections and retains a
+successfully recovered context until its worker shuts down. Consult the loader
+diagnostics and existing runtime-library/device permissions; the exporter does
+not create or repair host library symlinks.
 
 ## VM passthrough
 

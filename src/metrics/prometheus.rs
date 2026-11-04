@@ -41,13 +41,23 @@ impl PrometheusFormatter {
         output.push('\n');
 
         // GPU availability metrics
-        output.push_str("# HELP DCXP_GPU_AVAILABLE Whether GPUs are available to host (0=VM passthrough, 1=available)\n");
+        output.push_str("# HELP DCXP_GPU_AVAILABLE Whether current NVML or VM GPU records are available (0=none, 1=present)\n");
         output.push_str("# TYPE DCXP_GPU_AVAILABLE gauge\n");
         output.push_str(&format!(
             "DCXP_GPU_AVAILABLE{{Hostname=\"{}\"}} {}\n",
             metrics.hostname,
             if metrics.gpus_available { 1 } else { 0 }
         ));
+
+        // TRACEWEAVER: req=REQ-NVML-003; trace=TRACE-NVML-003; ver=VER-NVML-003
+        output.push_str("# HELP DCXP_NVML_COLLECTION_STATUS Current host NVML collection outcome, independent of device health\n");
+        output.push_str("# TYPE DCXP_NVML_COLLECTION_STATUS gauge\n");
+        for status in super::NvmlCollectionStatus::ALL {
+            output.push_str(&format!(
+                "DCXP_NVML_COLLECTION_STATUS{{Hostname=\"{}\",status=\"{}\"}} {}\n",
+                metrics.hostname, status.as_str(), u8::from(status == metrics.nvml_collection_status)
+            ));
+        }
 
         output.push_str("# HELP DCXP_GPU_COUNT GPU count by type: pcie=physical devices, nvml=successfully constructed NVML records, usable=healthy host or VM telemetry plus confirmed passthrough devices\n");
         output.push_str("# TYPE DCXP_GPU_COUNT gauge\n");
@@ -1005,6 +1015,19 @@ mod tests {
         assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_RECOVERY_ACTION_STATUS{") && l.contains("status=\"valid\"") && l.ends_with(" 1")));
         assert!(output.lines().any(|l|l.starts_with("DCXP_GPU_NVML_ERROR{") && l.contains("query=\"power_usage\"") && l.contains("error=\"gpu_lost\"") && l.contains("code=\"15\"") && l.ends_with(" 1")));
         assert!(!has_sample(&output,"DCGM_FI_DEV_POWER_USAGE","GPU-SYNTHETIC-3"));
+    }
+
+    #[test]
+    fn nvml_loader_default_status_is_current_worker_unavailable() {
+        let output = PrometheusFormatter::format(&AllMetrics { hostname: "loader-fixture".into(), ..Default::default() });
+        crate::metrics::gpu::tests::nvml_loader_assert_one_hot(&output, "worker_unavailable");
+    }
+
+    #[test]
+    fn nvml_loader_available_help_does_not_attribute_every_zero_to_passthrough() {
+        let output = PrometheusFormatter::format(&AllMetrics::default());
+        let help = output.lines().find(|line| line.starts_with("# HELP DCXP_GPU_AVAILABLE ")).unwrap();
+        assert!(!help.contains("0=VM passthrough"), "global loader failure is also unavailable");
     }
 
 }

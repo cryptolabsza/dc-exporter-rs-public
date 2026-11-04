@@ -33,11 +33,16 @@ fn healthy(bdf: &str, uuid: &str) -> GpuMetrics {
 }
 
 #[test]
-fn thermal_defaults_are_legacy_and_only_explicit_cli_values_override_toml() {
+fn thermal_defaults_are_auto_and_only_explicit_cli_values_override_toml() {
     let cfg: config::Config =
         toml::from_str("[thermal]\nvram_backend='rusd'\ntimeout_ms=90\n").unwrap();
     let default = ThermalPolicy::default();
-    assert_eq!(default.vram_backend, ThermalBackend::Legacy);
+    assert_eq!(ThermalBackend::default(), ThermalBackend::Auto);
+    assert_eq!(default.vram_backend, ThermalBackend::Auto);
+    for document in ["", "[thermal]\n", "[thermal]\ntimeout_ms=90\n"] {
+        let cfg: config::Config = toml::from_str(document).unwrap();
+        assert_eq!(cfg.thermal.vram_backend, ThermalBackend::Auto, "{document}");
+    }
     assert_eq!(default.timeout_ms, 2000);
     assert_eq!(
         default.sample_age(Duration::from_secs(1)),
@@ -55,6 +60,21 @@ fn thermal_defaults_are_legacy_and_only_explicit_cli_values_override_toml() {
     assert_eq!(resolved.timeout_ms, 40);
     assert!(cfg.thermal.resolve(None, Some(0), None).is_err());
     assert!(toml::from_str::<config::Config>("[thermal]\nvram_backend='invented'").is_err());
+    for (wire, backend) in [
+        ("legacy", ThermalBackend::Legacy),
+        ("auto", ThermalBackend::Auto),
+        ("nvml", ThermalBackend::Nvml),
+        ("rusd", ThermalBackend::Rusd),
+        ("off", ThermalBackend::Off),
+    ] {
+        let cfg: config::Config =
+            toml::from_str(&format!("[thermal]\nvram_backend='{wire}'\n")).unwrap();
+        assert_eq!(cfg.thermal.resolve(None, None, None).unwrap().vram_backend, backend);
+        assert_eq!(
+            cfg.thermal.resolve(Some(ThermalBackend::Legacy), None, None).unwrap().vram_backend,
+            ThermalBackend::Legacy
+        );
+    }
 }
 
 #[test]
@@ -287,7 +307,11 @@ fn legacy_and_off_never_launch_helper_and_off_preserves_core_and_hotspot() {
     gpu.vram_temp = Some(72);
     gpu.hotspot_temp = Some(80);
     let mut gpus = vec![gpu];
-    ThermalPolicy::default().enrich(&mut gpus, &manager, Duration::from_secs(10));
+    ThermalPolicy {
+        vram_backend: ThermalBackend::Legacy,
+        ..Default::default()
+    }
+    .enrich(&mut gpus, &manager, Duration::from_secs(10));
     assert_eq!(gpus[0].vram_temp, Some(72));
     assert_eq!(manager.max_live_children(), 0);
     let off = ThermalPolicy {
@@ -419,6 +443,8 @@ fn auto_falls_back_only_on_unsupported_and_forced_nvml_never_uses_legacy() {
         (ThermalBackend::Auto, "invalid", None),
         (ThermalBackend::Auto, "stale", None),
         (ThermalBackend::Auto, "permission_denied", None),
+        (ThermalBackend::Auto, "timeout", None),
+        (ThermalBackend::Auto, "device_lost", None),
         (ThermalBackend::Nvml, "unsupported", None),
     ] {
         let code=format!("import sys,json,struct\nn=struct.unpack('<I',sys.stdin.buffer.read(4))[0];q=json.loads(sys.stdin.buffer.read(n))\nr={{'request_id':q['request_id'],'readings':[{{'backend':'nvml','pci_bus_id':'0000:23:00.0','uuid':'GPU-A','celsius':None,'status':'{status}'}}]}}\nb=json.dumps(r).encode();sys.stdout.buffer.write(struct.pack('<I',len(b))+b);sys.stdout.buffer.flush()\n");
@@ -437,6 +463,117 @@ fn auto_falls_back_only_on_unsupported_and_forced_nvml_never_uses_legacy() {
         }
         .enrich(&mut gpus, &manager, Duration::from_secs(10));
         assert_eq!(gpus[0].vram_temp, expected, "{backend:?}/{status}");
+    }
+}
+
+fn reply_manager(readings: serde_json::Value) -> metrics::thermal_worker::ThermalManager {
+    let encoded = serde_json::to_string(&readings.to_string()).unwrap();
+    let code = format!(
+        "import sys,json,struct\nn=struct.unpack('<I',sys.stdin.buffer.read(4))[0];q=json.loads(sys.stdin.buffer.read(n))\nassert q['backend']=='auto'\nr={{'request_id':q['request_id'],'readings':json.loads({encoded})}}\nb=json.dumps(r).encode();sys.stdout.buffer.write(struct.pack('<I',len(b))+b);sys.stdout.buffer.flush()\n"
+    );
+    metrics::thermal_worker::ThermalManager::with_command(
+        "/usr/bin/python3".into(), vec!["-c".into(), code],
+    )
+}
+
+// TRACE-THERMAL-003/008/012: selection is independent for every current GPU.
+#[test]
+fn auto_mixed_official_memory_and_unsupported_legacy_preserve_hotspots() {
+    let cards = [
+        ("NVIDIA A100-SXM4-80GB", 0x20b0, Some(0), Some(49)),
+        ("NVIDIA H100 PCIe", 0x2331, Some(0), Some(55)),
+        ("NVIDIA RTX A6000", 0x2230, Some(70), None),
+        ("NVIDIA GeForce RTX 4090", 0x2684, Some(72), None),
+        ("NVIDIA RTX 6000 Ada Generation", 0x26b1, Some(74), None),
+        ("NVIDIA L40S", 0x26b9, Some(76), None),
+    ];
+    let mut gpus = Vec::new();
+    let mut replies = Vec::new();
+    for (index, (name, device_id, legacy, official)) in cards.iter().enumerate() {
+        let mut gpu = healthy(&format!("0000:{:02x}:00.0", 0x20 + index), &format!("GPU-{index}"));
+        gpu.name = (*name).into();
+        gpu.device_id = *device_id;
+        gpu.architecture = GpuArchitecture::from_name(name);
+        gpu.vram_temp = *legacy;
+        gpu.hotspot_temp = Some(83);
+        if official.is_none() {
+            gpu.vram_thermal = Some(ThermalMetadata {
+                backend: ThermalBackend::Legacy, status: ThermalStatus::Valid,
+            });
+        }
+        replies.push(serde_json::json!({
+            "backend": "nvml", "pci_bus_id": gpu.pci_bus_id, "uuid": gpu.uuid,
+            "celsius": official, "status": if official.is_some() { "valid" } else { "unsupported" },
+            "remaining_validity_us": 30_000_000,
+        }));
+        gpus.push(gpu);
+    }
+    // A helper may return a different enumeration order; only BDF + UUID join it.
+    replies.reverse();
+    let manager = reply_manager(serde_json::Value::Array(replies));
+    ThermalPolicy { vram_backend: ThermalBackend::Auto, ..Default::default() }
+        .enrich(&mut gpus, &manager, Duration::from_secs(10));
+    assert_eq!(manager.max_live_children(), 1);
+    for (gpu, (_, _, legacy, official)) in gpus.iter().zip(cards) {
+        assert_eq!(gpu.vram_temp, official.or(legacy), "{}", gpu.name);
+        assert_eq!(gpu.hotspot_temp, Some(83), "{}", gpu.name);
+        assert_eq!(gpu.gpu_temp, Some(58));
+        assert_eq!(gpu.power_usage, Some(120.0));
+        assert!(measured_vram_supported(gpu), "{}", gpu.name);
+        assert_eq!(gpu.vram_thermal, Some(ThermalMetadata {
+            backend: if official.is_some() { ThermalBackend::Nvml } else { ThermalBackend::Legacy },
+            status: ThermalStatus::Valid,
+        }));
+    }
+}
+
+#[test]
+fn auto_unsupported_cannot_promote_datacenter_zero_or_approximated_legacy() {
+    for approximated in [false, true] {
+        let mut gpu = healthy("0000:23:00.0", "GPU-A");
+        gpu.architecture = GpuArchitecture::Datacenter;
+        gpu.vram_temp = Some(if approximated { 72 } else { 0 });
+        gpu.vram_temp_approximated = approximated;
+        let manager = reply_manager(serde_json::json!([{
+            "backend":"nvml", "pci_bus_id":gpu.pci_bus_id, "uuid":gpu.uuid,
+            "celsius":null, "status":"unsupported",
+        }]));
+        let mut gpus = vec![gpu];
+        ThermalPolicy { vram_backend: ThermalBackend::Auto, ..Default::default() }
+            .enrich(&mut gpus, &manager, Duration::from_secs(10));
+        assert_eq!(gpus[0].vram_temp, None);
+        assert!(!measured_vram_supported(&gpus[0]));
+        assert_eq!(gpus[0].vram_thermal.as_ref().unwrap().status, ThermalStatus::Unsupported);
+    }
+}
+
+#[test]
+fn auto_never_launches_helper_for_unhealthy_or_ambiguous_host_identity() {
+    for case in 0..11 {
+        let mut gpu = healthy("0000:23:00.0", "GPU-A");
+        match case {
+            0 => gpu.state = GpuState::Error,
+            1 => gpu.state = GpuState::Unavailable,
+            2 => gpu.state = GpuState::HardwareFailure,
+            3 => gpu.state = GpuState::VmPassthrough,
+            4 => gpu.nvml_essential_query_failed = true,
+            5 => gpu.fallen_off_bus = true,
+            6 => gpu.dmesg_hardware_failure = true,
+            7 => gpu.bound_driver = Some("vfio-pci".into()),
+            8 => gpu.uuid.clear(),
+            9 => gpu.pci_bus_id = "23:00.0".into(),
+            _ => (),
+        }
+        let mut gpus = vec![gpu.clone()];
+        if case == 10 { gpus.push(gpu); }
+        let manager = metrics::thermal_worker::ThermalManager::with_command("/does/not/exist".into(), vec![]);
+        ThermalPolicy { vram_backend: ThermalBackend::Auto, ..Default::default() }
+            .enrich(&mut gpus, &manager, Duration::from_secs(10));
+        assert_eq!(manager.max_live_children(), 0, "case {case}");
+        for gpu in gpus {
+            assert_eq!(gpu.vram_temp, None, "case {case}");
+            assert_eq!(gpu.vram_thermal.as_ref().unwrap().status, ThermalStatus::Unsupported);
+        }
     }
 }
 
