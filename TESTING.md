@@ -33,7 +33,12 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 The thermal policy/worker and NVIDIA RM suites exercise deadlines, malformed
 frames, identity, concurrency, fallback, sequence decoding and cleanup without
-GPU calls. The two hardware-test filters do not establish any hardware result.
+GPU calls. Automatic-selection coverage must verify absent-config `auto`, explicit
+CLI/TOML precedence, mixed official-memory and existing legacy readings, exact
+legacy PCI eligibility, independent hotspot preservation, and unsupported-only
+fallback. Preserve no-register, current health, guest exclusion, BDF/UUID identity,
+freshness and forced-mode rejection tests. Software tests do not qualify sensors.
+The two hardware-test filters do not establish any hardware result.
 
 ## Notice and distribution verification
 
@@ -62,8 +67,8 @@ These tests do not prove effective GitHub admission or actual guest isolation.
 
 ## Hardware acceptance remains separate
 
-RUSD remains opt-in for RTX 5090 PCI device `0x2b85`, Linux x86-64 and only the
-three exact drivers above. Unknown, adjacent and suffixed versions fail closed.
+Default `auto` can select experimental RUSD for RTX 5090 PCI device `0x2b85`,
+Linux x86-64 and only the three exact drivers above. Unknown, adjacent and suffixed versions fail closed.
 Limited functional reads exist for 590 and deployed 615; the publication record
 has not verified loaded-driver evidence for 595. Independent sensor accuracy,
 complete GPU Burn/NCCL qualification and full workload noninterference remain

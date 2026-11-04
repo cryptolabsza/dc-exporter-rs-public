@@ -10,8 +10,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ThermalBackend {
-    #[default]
     Legacy,
+    #[default]
     Auto,
     Nvml,
     Rusd,
@@ -83,7 +83,7 @@ pub struct ThermalPolicy {
 impl Default for ThermalPolicy {
     fn default() -> Self {
         Self {
-            vram_backend: ThermalBackend::Legacy,
+            vram_backend: ThermalBackend::Auto,
             timeout_ms: 2000,
             max_sample_age_ms: None,
         }

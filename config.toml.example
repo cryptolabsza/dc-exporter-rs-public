@@ -3,10 +3,11 @@
 # Only these thermal settings are currently applied from this file.
 # Other sections below retain the existing CLI-controlled behavior.
 [thermal]
-vram_backend = "legacy"       # legacy | auto | nvml | rusd | off
+vram_backend = "auto"       # legacy | auto | nvml | rusd | off
 timeout_ms = 2000
 # max_sample_age_ms = 30000   # default: max(3 * CLI interval, deadline)
-# auto/rusd are experimental; RTX 5090 real-card acceptance is pending.
+# auto prefers official NVML, then exact experimental RUSD, then permitted legacy BAR.
+# Fallback requires Unsupported; explicit CLI overrides TOML. RTX 5090 acceptance is pending.
 # --vram-backend and --thermal-*-ms explicitly override this section.
 # Copy to /etc/dc-exporter/config.toml
 
