@@ -1,21 +1,23 @@
 <!-- TRACEWEAVER: file-role=thermal-support-guide; req=REQ-THERMAL-012; trace=TRACE-THERMAL-012; ver=VER-THERMAL-010 -->
 # GPU thermal methods
 
-The source adds opt-in aggregate memory temperature. `legacy` remains the default and never starts the new helper. RTX 5090 RUSD support is an experimental candidate; software tests do not establish hardware accuracy or production noninterference.
+The default is `auto`: select memory temperature independently per eligible host GPU, preferring the official NVML field, then an exact supported RUSD profile, then an existing permitted measured legacy BAR reading. Fall back only on explicit unsupported results. Explicit CLI/TOML modes remain authoritative; forced `legacy` never starts the optional helper. RTX 5090 RUSD support is an experimental candidate; software tests do not establish hardware accuracy or production noninterference.
 
 | Method | Behavior |
 | --- | --- |
 | `legacy` | Existing BAR and guest paths; RTX 50-series BAR offsets stay disabled. |
-| `auto` | Try NVML memory field 82; on explicit unsupported, try the candidate RUSD profile; on unsupported, retain a permitted legacy reading. |
+| `auto` (default) | Try NVML memory field 82; on explicit unsupported, try the candidate RUSD profile; on unsupported, retain a permitted legacy reading. |
 | `nvml` | Exact NVML memory-temperature field only; no silent fallback. |
 | `rusd` | NVIDIA RM shared-data memory entry only; no NVML or BAR fallback. |
 | `off` | Explicitly suppress VRAM temperature on hosts and guests; keep core and hotspot collection. |
 
-NVML per-field permission, invalidity, device loss and stale results stop fallback. RUSD is limited to Linux x86-64, NVIDIA exact `590.48.01`, `595.99.02` or `615.71.09`, PCI device `0x2b85`. Adjacent versions, suffixed versions and unknown 6xx profiles are unsupported. The candidate remains subject to the [real-card acceptance procedure](validation/rtx5090-acceptance.md) and the [pinned public ABI provenance](gpu-thermal-abi.md). The separately authorized 590 idle smoke returned 14 valid readings across seven cards in two serial passes (34–36°C), with clean helper exits and unchanged observed GPU error/idle state. Independent accuracy, raw comparison, full integration, GPU Burn/NCCL qualification and soak remain pending. Loaded-driver evidence for595 has not been verified for this publication record. Fresh deployed functional memory readings exist for615 on operational GPUs; these observations do not establish full accuracy or workload noninterference. No full hardware acceptance result is claimed.
+This policy supports mixed A100/H100 official-memory and older RTX/Ada legacy-memory fleets without per-host GPU-family overrides. Forced `nvml` cannot preserve fleet-wide legacy coverage when the official field is unsupported. Official-first describes selected memory output; existing BAR memory/hotspot acquisition may occur independently before selection. There is no generic official hotspot sensor in these backends: retain independently measured legacy hotspot, never substitute core or memory temperature. `--no-register-access` blocks legacy BAR acquisition even when it would provide fallback.
+
+NVML per-field permission, invalidity, device loss and stale results stop fallback. Default `auto` may select experimental RUSD, which is limited to Linux x86-64, NVIDIA exact `590.48.01`, `595.99.02` or `615.71.09`, PCI device `0x2b85`. Adjacent versions, suffixed versions and unknown 6xx profiles are unsupported. The candidate remains subject to the [real-card acceptance procedure](validation/rtx5090-acceptance.md) and the [pinned public ABI provenance](gpu-thermal-abi.md). The separately authorized 590 idle smoke returned 14 valid readings across seven cards in two serial passes (34–36°C), with clean helper exits and unchanged observed GPU error/idle state. Independent accuracy, raw comparison, full integration, GPU Burn/NCCL qualification and soak remain pending. Loaded-driver evidence for595 has not been verified for this publication record. Fresh deployed functional memory readings exist for615 on operational GPUs; these observations do not establish full accuracy or workload noninterference. No full hardware acceptance result is claimed.
 
 ```toml
 [thermal]
-vram_backend = "legacy"
+vram_backend = "auto"
 timeout_ms = 2000
 # max_sample_age_ms = 30000
 ```
@@ -32,7 +34,7 @@ The optional batch deadline includes parent pipe I/O and waiting for successful 
 
 Existing scalar names and labels remain intact, including the established zero failure sentinel. `DCXP_FI_DEV_VRAM_TEMP_VALID` distinguishes unavailable zero from a measured zero. `DCXP_FI_DEV_VRAM_TEMP_BACKEND_INFO` exposes finite `backend` and `status` labels. `DCXP_GPU_SUPPORTED` is one only for a current valid, non-approximated memory measurement; the old datacenter placeholder zero is unsupported. TUI detail shows the selected method and status.
 
-Development retains version `0.2.7` and default `legacy`. Confine the owner-approved v0.3.0 version bump to its reviewed main promotion, then require the accepted protected-main build, exact source tag and verified publisher readback before publication is considered complete. That versioned release may contain opt-in experimental RUSD without qualifying RTX 5090 support. Qualified support promotion requires accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
+Development retains version `0.2.7`; the owner-approved 25 October 2026 selection amendment changes the default to `auto`. Confine the owner-approved v0.3.0 version bump to its reviewed main promotion, then require the accepted protected-main build, exact source tag and verified publisher readback before publication is considered complete. RUSD remains experimental whether selected explicitly or by `auto`; automatic selection does not qualify RTX 5090 support. Qualified support promotion requires accepted hardware evidence and independent review. No production probe, deployment, reboot or workload test is part of software verification.
 
 ## VM register-policy correction candidate
 
@@ -40,6 +42,6 @@ The source candidate's direct-register policy includes guest-agent commands: `--
 
 Guest register eligibility is separate from host thermal compatibility. The validated guest BAR profile set is empty, so guest BAR reads remain disabled with either flag setting. A future profile requires the exact guest PCI device, architecture, driver/environment, permitted register mechanism and offsets, and validation evidence. A model-name substring or host RUSD profile cannot establish guest eligibility. No new guest RUSD backend or RTX5090/Ada guest-memory support is claimed. Supplied valid guest temperature fixtures preserve their values and provenance only after unambiguous guest-to-host BDF mapping; unsupported or missing sensors remain unavailable.
 
-Operational acceptance remains **HELD** under the [bounded VM procedure](validation/vm-passthrough-acceptance.md). This document supplies no software/build or live pass result. The development package remains `0.2.7`; the reviewed main promotion carries `0.3.0`. Default `legacy`, metric/status contracts, TUI and CryptoLabs branding remain the preservation contract in both channels.
+Operational acceptance remains **HELD** under the [bounded VM procedure](validation/vm-passthrough-acceptance.md). This document supplies no software/build or live pass result. The development package remains `0.2.7`; the reviewed main promotion carries `0.3.0`. Metric/status contracts, TUI, CryptoLabs branding and guest isolation remain preserved; the default is now `auto`.
 
-Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; development version `0.2.7` and default `legacy` are preserved; a main-only release version bump supplies no hardware or live VM acceptance evidence.
+Official software candidates use the protected-ref shared pool described in [TESTING.md](../TESTING.md). CI runs exact pinned driver-free ABI checks before Cargo and never probes GPUs. The terminal UI remains available through `--tui`; development version `0.2.7` is preserved and the default is `auto`; a main-only release version bump supplies no hardware or live VM acceptance evidence.

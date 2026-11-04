@@ -87,6 +87,16 @@ impl MetricsCollector {
     }
 }
 
+/// Move the current host outcome into the exported snapshot before reconciling
+/// device identities. Collection success and per-device health remain independent.
+// TRACEWEAVER: req=REQ-NVML-003; trace=TRACE-NVML-003; ver=VER-NVML-003
+fn apply_nvml_collection_result(result: super::NvmlCollectionResult, metrics: &mut AllMetrics) -> Vec<GpuMetrics> {
+    metrics.nvml_collection_status = result.status;
+    metrics.nvml_gpus = result.gpus.len() as u32;
+    metrics.nvml_unmatched_errors = result.unmatched_errors;
+    result.gpus
+}
+
 /// Synchronous metrics collector (runs in blocking thread)
 struct MetricsCollectorSync {
     nvml_collector: NvmlCollector,
@@ -512,13 +522,14 @@ fn gpus_available_from_enumeration(nvml_gpus: u32, vm_gpus: usize) -> bool {
     nvml_gpus > 0 || vm_gpus > 0
 }
 
+// TRACE-THERMAL-008/012: retain exact existing BAR profiles for every architecture.
 fn should_collect_register_telemetry(gpu: &GpuMetrics, register_available: bool) -> bool {
     register_available
         && gpu.source == MetricSource::Host
         && gpu.bound_driver.as_deref() == Some("nvidia")
         && !gpu.nvml_essential_query_failed
         && matches!(gpu.state, GpuState::Ok | GpuState::Warning)
-        && gpu.architecture.use_register_access()
+        && get_gpu_info(gpu.device_id).is_some()
 }
 
 // TRACEWEAVER: entrypoint=build_passthrough_evidence; req=VM-FIX-001,VM-FIX-002; trace=TRACE-VM-001,TRACE-VM-002
@@ -861,6 +872,7 @@ impl MetricsCollectorSync {
         // This NEVER blocks, even during passthrough
         let pci_gpus = scan_nvidia_gpus();
         let total_pci_gpus = pci_gpus.len() as u32;
+        let mut metrics = AllMetrics { hostname, timestamp, total_pci_gpus, ..Default::default() };
         debug!("Found {} NVIDIA GPUs on PCIe bus", total_pci_gpus);
 
         // Build host GPU map (PCI bus ID -> index)
@@ -873,17 +885,17 @@ impl MetricsCollectorSync {
         // Step 2: Collect ALL NVML metrics in a SINGLE session (avoids FD leak!)
         // This is the ONLY Nvml::init() call per collection cycle
         let nvml_result = self.nvml_collector.collect_all();
-        let nvml_gpus = nvml_result.gpus.len() as u32;
         let nvml_initialized = nvml_result.nvml_initialized;
-        let mut nvml_unmatched_errors=nvml_result.unmatched_errors;
-        let driver_version = nvml_result.gpus.first()
+        let nvml_rows = apply_nvml_collection_result(nvml_result, &mut metrics);
+        let nvml_gpus = metrics.nvml_gpus;
+        let driver_version = nvml_rows.first()
             .map(|g| g.driver_version.clone())
             .unwrap_or_else(|| "unknown".to_string());
         
         debug!("NVML returned {} GPU records, initialized={}", nvml_gpus, nvml_initialized);
 
-        let (nvml_metrics,identity_diagnostics)=reconcile_nvml_inventory(nvml_result.gpus,&pci_gpus);
-        nvml_unmatched_errors.extend(identity_diagnostics);
+        let (nvml_metrics,identity_diagnostics)=reconcile_nvml_inventory(nvml_rows,&pci_gpus);
+        metrics.nvml_unmatched_errors.extend(identity_diagnostics);
 
         // Step 4: Collect VM metrics for GPUs passed through to VMs
         // This also identifies which PCI addresses are confirmed passthrough via virsh dumpxml
@@ -910,7 +922,7 @@ impl MetricsCollectorSync {
         {
             let mut tracker=self.hardware_evidence_tracker.lock().unwrap_or_else(|p|p.into_inner());
             canonicalize_dmesg_inventory(&mut dmesg_errors,&pci_gpus,&mut tracker);
-            observe_unmatched_current_health(&nvml_unmatched_errors,&mut tracker);
+            observe_unmatched_current_health(&metrics.nvml_unmatched_errors,&mut tracker);
         }
         if !dmesg_errors.per_gpu.is_empty() {
             info!("Dmesg GPU errors found for {} GPUs", dmesg_errors.per_gpu.len());
@@ -931,17 +943,11 @@ impl MetricsCollectorSync {
         );
         // Step 6: Collect system metrics
         let apt_upgradable = count_apt_upgradable();
-        AllMetrics {
-            hostname,
-            driver_version,
-            total_pci_gpus,
-            nvml_gpus,
-            gpus_available: gpus_available_from_enumeration(nvml_gpus, vm_metrics.len()),
-            gpus,
-            apt_upgradable,
-            timestamp,
-            nvml_unmatched_errors,
-        }
+        metrics.driver_version = driver_version;
+        metrics.gpus_available = gpus_available_from_enumeration(nvml_gpus, vm_metrics.len());
+        metrics.gpus = gpus;
+        metrics.apt_upgradable = apt_upgradable;
+        metrics
     }
 }
 
@@ -2388,6 +2394,94 @@ mod tests {
         }
     }
 
+    // TRACE-THERMAL-008/012: the existing exact BAR profile, not architecture, authorizes reads.
+    #[test]
+    fn auto_thermal_exact_bar_profiles_cover_l40s_l40_l4_and_older_rtx() {
+        for (name, device_id) in [
+            ("NVIDIA L40S", 0x26b9),
+            ("NVIDIA L40", 0x26b5),
+            ("NVIDIA L4", 0x27b8),
+            ("NVIDIA RTX A6000", 0x2230),
+            ("NVIDIA GeForce RTX 4090", 0x2684),
+            ("NVIDIA RTX 6000 Ada Generation", 0x26b1),
+        ] {
+            let mut pci = pci_gpu("0000:23:00.0");
+            pci.device_id = device_id;
+            let mut gpu = GpuMetrics {
+                pci_bus_id: pci.pci_bus_id.clone(),
+                uuid: "GPU-ALLOWLIST".into(),
+                name: name.into(),
+                device_id,
+                architecture: GpuArchitecture::from_name(name),
+                bound_driver: Some("nvidia".into()),
+                ..Default::default()
+            };
+            assert!(get_gpu_info(device_id).is_some(), "fixture must use existing profile: {name}");
+            collect_host_register_temps_with(&mut gpu, &pci, false, false, |_, _| {
+                panic!("--no-register-access invoked reader for {name}")
+            });
+            assert_eq!(gpu.vram_temp, None);
+            assert_eq!(gpu.hotspot_temp, None);
+            assert!(should_collect_register_telemetry(&gpu, true), "{name}");
+            let mut calls = Vec::new();
+            collect_host_register_temps_with(&mut gpu, &pci, true, false, |bar, offset| {
+                calls.push((bar, offset));
+                super::super::register::RegisterTemps { vram_temp: Some(73), hotspot_temp: Some(81) }
+            });
+            assert_eq!(calls, vec![(0x1000, get_gpu_info(device_id).unwrap().vram_offset)], "{name}");
+            assert_eq!(gpu.vram_temp, Some(73), "{name}");
+            assert_eq!(gpu.hotspot_temp, Some(81), "{name}");
+            assert_eq!(gpu.vram_thermal, Some(super::super::thermal::ThermalMetadata {
+                backend: super::super::thermal::ThermalBackend::Legacy,
+                status: super::super::thermal::ThermalStatus::Valid,
+            }));
+        }
+    }
+
+    #[test]
+    fn auto_thermal_bar_allowlist_retains_policy_health_ownership_and_unknown_device_gates() {
+        for case in 0..15 {
+            let mut pci = pci_gpu("0000:23:00.0");
+            pci.device_id = 0x26b9;
+            let mut gpu = GpuMetrics {
+                pci_bus_id: pci.pci_bus_id.clone(),
+                device_id: pci.device_id,
+                architecture: GpuArchitecture::Datacenter,
+                bound_driver: Some("nvidia".into()),
+                ..Default::default()
+            };
+            match case {
+                1 => gpu.source = MetricSource::Vm,
+                2 => gpu.source = MetricSource::Pci,
+                3 => gpu.bound_driver = None,
+                4 => gpu.bound_driver = Some("vfio-pci".into()),
+                5 => gpu.nvml_essential_query_failed = true,
+                6 => gpu.state = GpuState::Error,
+                7 => gpu.state = GpuState::HardwareFailure,
+                8 => gpu.state = GpuState::Unavailable,
+                9 => gpu.state = GpuState::VmPassthrough,
+                10 => pci.bound_driver = Some("vfio-pci".into()),
+                11 => gpu.pci_bus_id = "0000:24:00.0".into(),
+                12 => gpu.device_id = 0x26b5,
+                13 => pci.bar0_addr = None,
+                _ => (),
+            }
+            collect_host_register_temps_with(&mut gpu, &pci, case != 0, case == 14, |_, _| {
+                panic!("rejected BAR case {case} invoked reader")
+            });
+            assert_eq!(gpu.vram_temp, None, "case {case}");
+        }
+        for architecture in [GpuArchitecture::Consumer, GpuArchitecture::Datacenter, GpuArchitecture::Unknown] {
+            for device_id in [0xffff, 0x20b0, 0x2331, 0x2b85] {
+                let gpu = GpuMetrics {
+                    device_id, architecture, bound_driver: Some("nvidia".into()), ..Default::default()
+                };
+                assert!(get_gpu_info(device_id).is_none());
+                assert!(!should_collect_register_telemetry(&gpu, true), "{architecture:?}/{device_id:x}");
+            }
+        }
+    }
+
     // TRACEWEAVER: verifies=VER-VM-005; req=VM-FIX-005; trace=TRACE-VM-005
     #[test]
     fn vm_definition_real_merge_retains_owned_host_bar_positive_control() {
@@ -2521,6 +2615,65 @@ mod tests {
         let output = PrometheusFormatter::format(&AllMetrics {gpus: rows, ..Default::default()});
         assert!(output.lines().any(|line| line.starts_with("DCXP_GPU_STATE{") && line.ends_with(" 1")));
         assert!(output.lines().any(|line| line.starts_with("DCXP_FI_DEV_VRAM_TEMP{") && line.ends_with(" 74")));
+    }
+
+    // VER-NVML-003/004: global collection loss does not invent physical faults,
+    // identities, or usable telemetry; current recovery restores verified UUIDs.
+    #[test]
+    fn nvml_loader_global_loss_and_real_identity_recovery() {
+        let _guard = crate::metrics::gpu::tests::health_definition_fixture_lock();
+        let inventory: Vec<_> = (0..8).map(|index| pci_gpu(&format!("0000:{:02x}:00.0", 0x50 + index))).collect();
+        let dmesg = successful_empty_dmesg();
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&dmesg));
+        let failed = merge_gpu_snapshot(&inventory, HashMap::new(), &[], &HashSet::new(), false, "", &dmesg,
+            &tracker, false, |_, _| panic!("global failure must not read registers"));
+        assert_eq!(failed.len(), 8); assert_eq!(count_usable_gpus(&failed), 0);
+        for gpu in &failed {
+            assert_eq!(gpu.state.as_u8(), 2); assert!(!gpu.dmesg_hardware_failure);
+            assert!(gpu.nvml_errors.is_empty());
+            assert_eq!((gpu.gpu_temp, gpu.power_usage, gpu.fb_used), (None, None, None));
+        }
+        let mut metrics = AllMetrics {
+            hostname: "loader-fixture".into(), total_pci_gpus: 8, gpus: failed, ..Default::default()
+        };
+        let rows = apply_nvml_collection_result(super::super::NvmlCollectionResult {
+            gpus: Vec::new(), nvml_initialized: false, unmatched_errors: Vec::new(),
+            status: super::super::NvmlCollectionStatus::LibraryLoadError,
+        }, &mut metrics);
+        assert!(rows.is_empty());
+        let failed_output = PrometheusFormatter::format(&metrics);
+        for (kind, count) in [("pcie", 8), ("nvml", 0), ("usable", 0)] {
+            assert!(failed_output.contains(&format!("DCXP_GPU_COUNT{{type=\"{kind}\",Hostname=\"loader-fixture\"}} {count}")));
+        }
+        assert!(!failed_output.lines().any(|line| line.starts_with("DCXP_GPU_NVML_ERROR{")));
+        crate::metrics::gpu::tests::nvml_loader_assert_one_hot(&failed_output, "library_load_error");
+        let context = super::super::gpu::NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
+        let snapshot = super::super::gpu::collect_metrics_from_nvml(&context);
+        let recovered_rows = apply_nvml_collection_result(snapshot, &mut metrics);
+        let (records, unmatched) = reconcile_nvml_inventory(recovered_rows, &inventory);
+        assert!(unmatched.is_empty()); assert_eq!(records.len(), 8);
+        let recovered = merge_gpu_snapshot(&inventory, records, &[], &HashSet::new(), true, "615.71.09", &dmesg,
+            &tracker, false, |_, _| panic!("disabled register reader"));
+        assert_eq!(count_usable_gpus(&recovered), 8);
+        for (index, gpu) in recovered.iter().enumerate() {
+            assert_eq!(gpu.uuid, format!("GPU-SYNTHETIC-{index}")); assert_eq!(gpu.state.as_u8(), 1);
+        }
+        metrics.gpus = recovered;
+        let output = PrometheusFormatter::format(&metrics);
+        assert!(output.contains("DCXP_GPU_COUNT{type=\"usable\",Hostname=\"loader-fixture\"} 8"));
+        crate::metrics::gpu::tests::nvml_loader_assert_one_hot(&output, "success");
+    }
+
+    #[test]
+    fn nvml_loader_global_loss_preserves_hardware_and_passthrough_precedence() {
+        let inventory = vec![pci_gpu("0000:50:00.0"), pci_gpu("0000:51:00.0"), pci_gpu("0000:52:00.0")];
+        let dmesg = terminal_dmesg("0000:50:00.0");
+        let tracker = Mutex::new(HardwareEvidenceTracker::from_boot_log(&successful_empty_dmesg()));
+        let assignments = HashSet::from(["0000:50:00.0".to_string(), "0000:51:00.0".to_string()]);
+        let gpus = merge_gpu_snapshot(&inventory, HashMap::new(), &[], &assignments, false, "", &dmesg,
+            &tracker, false, |_, _| panic!("global failure must not read registers"));
+        assert_eq!(gpus.iter().map(|gpu| gpu.state.as_u8()).collect::<Vec<_>>(), vec![5, 3, 2]);
+        assert_eq!(count_usable_gpus(&gpus), 1);
     }
 
 }

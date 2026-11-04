@@ -494,13 +494,13 @@ fn as_rm(status: ThermalStatus) -> RmStatus {
 }
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn collect_nvml(requests: &[RmRequest], deadline: Instant, age: Duration) -> Vec<ThermalReading> {
-    use nvml_wrapper::{structs::device::FieldId, Nvml};
-    let nvml = match Nvml::init() {
-        Ok(n) => n,
+    use nvml_wrapper::structs::device::FieldId;
+    let nvml = match super::nvml_loader::load() {
+        Ok((nvml,_)) => nvml,
         Err(e) => {
             return requests
                 .iter()
-                .map(|r| reading(r, ThermalBackend::Nvml, as_rm(nvml_status(&e)), None))
+                .map(|r| reading(r, ThermalBackend::Nvml, as_rm(nvml_status(&e.error)), None))
                 .collect()
         }
     };
@@ -700,4 +700,12 @@ mod freshness_tests {
             }
         }
     }
+}
+
+// VER-NVML-001: exercise the actual optional collector initialization without
+// sysfs, device handles, or GPU requests. Counter ownership is asserted by caller.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn nvml_loader_probe() {
+    let readings = collect_nvml(&[], Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
+    assert!(readings.is_empty());
 }

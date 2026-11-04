@@ -1,6 +1,6 @@
 [package]
 name = "dc-exporter"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["CryptoLabs ZA"]
 description = "GPU metrics exporter for Prometheus - VRAM temp, hotspot temp, throttle reasons"

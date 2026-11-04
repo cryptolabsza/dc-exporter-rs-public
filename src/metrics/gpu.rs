@@ -109,10 +109,16 @@ enum RawAccess {Available(RawNvml),Unsupported,Unavailable}
 /// Raw access never initializes/shuts down NVML or accepts a foreign Device.
 pub(super) struct NvmlContext {raw:RawAccess,nvml:Nvml}
 impl NvmlContext {
-    fn new()->Result<Self,NvmlError> {Self::open(std::ffi::OsStr::new("libnvidia-ml.so"))}
+    fn new()->Result<Self,super::nvml_loader::NvmlLoadError> {
+        let (nvml,path)=super::nvml_loader::load()?;
+        Self::retain_provider(nvml,path).map_err(Into::into)
+    }
+    #[cfg(test)]
     fn open(path:&std::ffi::OsStr)->Result<Self,NvmlError> {
+        Self::retain_provider(Nvml::builder().lib_path(path).init()?,path)
+    }
+    fn retain_provider(nvml:Nvml,path:&std::ffi::OsStr)->Result<Self,NvmlError> {
         use std::os::unix::ffi::OsStrExt;
-        let nvml=Nvml::builder().lib_path(path).init()?;
         let target=std::ffi::CString::new(path.as_bytes())?;
         // RTLD_NOLOAD forbids substituting another provider after wrapper init.
         let library=unsafe {libc::dlopen(target.as_ptr(),libc::RTLD_NOLOAD|libc::RTLD_NOW|libc::RTLD_LOCAL)};
@@ -164,12 +170,45 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 /// Global NVML worker manager (supports restart)
 static NVML_MANAGER: RwLock<Option<NvmlWorkerManager>> = RwLock::new(None);
 
+/// Current host outcome; successful enumeration does not declare GPU health.
+// TRACEWEAVER: req=REQ-NVML-003; trace=TRACE-NVML-003; ver=VER-NVML-003
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NvmlCollectionStatus {
+    Success,
+    LibraryLoadError,
+    InitializationError,
+    EnumerationError,
+    Timeout,
+    #[default]
+    WorkerUnavailable,
+}
+impl NvmlCollectionStatus {
+    pub const ALL: [Self;6] = [Self::Success,Self::LibraryLoadError,Self::InitializationError,Self::EnumerationError,Self::Timeout,Self::WorkerUnavailable];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success=>"success",Self::LibraryLoadError=>"library_load_error",
+            Self::InitializationError=>"initialization_error",Self::EnumerationError=>"enumeration_error",
+            Self::Timeout=>"timeout",Self::WorkerUnavailable=>"worker_unavailable",
+        }
+    }
+    fn initialization(error:&NvmlError)->Self {
+        if matches!(error,NvmlError::LibloadingError(_)) {Self::LibraryLoadError} else {Self::InitializationError}
+    }
+}
+
 /// Result of NVML collection - includes status info
 #[derive(Debug)]
 pub struct NvmlCollectionResult {
     pub gpus: Vec<GpuMetrics>,
-    pub nvml_initialized: bool,  // false = driver error, true = NVML worked
+    pub nvml_initialized: bool,  // current initialization, independent of enumeration
+    pub status: NvmlCollectionStatus,
     pub unmatched_errors: Vec<UnmatchedNvmlError>,
+}
+
+impl NvmlCollectionResult {
+    fn failure(status:NvmlCollectionStatus)->Self {
+        Self{gpus:Vec::new(),nvml_initialized:false,status,unmatched_errors:Vec::new()}
+    }
 }
 
 /// Request to the NVML worker
@@ -246,39 +285,17 @@ impl NvmlWorker {
     fn worker_loop(rx: Receiver<NvmlRequest>) {
         info!("NVML worker thread started");
         
-        // Keep NVML initialized for the lifetime of the worker
-        let (nvml, nvml_initialized) = match NvmlContext::new() {
-            Ok(n) => {
-                info!("NVML initialized successfully");
-                (Some(n), true)
-            }
-            Err(e) => {
-                warn!("Failed to initialize NVML: {:?}", e);
-                (None, false)
-            }
-        };
-        
-        // Track if we ever successfully init NVML
-        let mut ever_initialized = nvml_initialized;
-        
+        // TRACEWEAVER: req=REQ-NVML-002; trace=TRACE-NVML-002; ver=VER-NVML-002
+        // A recovered session has the same lifetime as a successful startup.
+        let mut context = NvmlContext::new();
+        if let Err(error) = &context { warn!("Failed to initialize NVML: {}", error); }
         while let Ok(request) = rx.recv() {
             match request {
                 NvmlRequest::CollectAll(response_tx) => {
-                    let result = if let Some(ref nvml) = nvml {
-                        collect_metrics_from_nvml(nvml)
-                    } else {
-                        // Try to init again in case driver was loaded
-                        match NvmlContext::new() {
-                            Ok(nvml) => {
-                                ever_initialized = true;
-                                collect_metrics_from_nvml(&nvml)
-                            }
-                            Err(_) => NvmlCollectionResult {
-                                gpus: Vec::new(),
-                                unmatched_errors: Vec::new(),
-                                nvml_initialized: ever_initialized,
-                            },
-                        }
+                    if context.is_err() { context = NvmlContext::new(); }
+                    let result = match &context {
+                        Ok(nvml) => collect_metrics_from_nvml(nvml),
+                        Err(error) => NvmlCollectionResult::failure(NvmlCollectionStatus::initialization(&error.error)),
                     };
                     let _ = response_tx.send(result);
                 }
@@ -296,7 +313,7 @@ impl NvmlWorker {
         info!("NVML worker thread exiting");
     }
     
-    fn collect_all(&self, timeout: Duration) -> Option<NvmlCollectionResult> {
+    fn collect_all(&self, timeout: Duration) -> Result<NvmlCollectionResult,NvmlCollectionStatus> {
         let (response_tx, response_rx) = mpsc::channel();
         
         // Send request to worker
@@ -304,17 +321,17 @@ impl NvmlWorker {
             let tx = self.tx.lock().unwrap();
             if tx.send(NvmlRequest::CollectAll(response_tx)).is_err() {
                 warn!("NVML worker channel closed");
-                return None;
+                return Err(NvmlCollectionStatus::WorkerUnavailable);
             }
         }
         
         // Wait for response with timeout
         match response_rx.recv_timeout(timeout) {
-            Ok(result) => Some(result),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Ok(result) => Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(NvmlCollectionStatus::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 warn!("NVML worker disconnected");
-                None
+                Err(NvmlCollectionStatus::WorkerUnavailable)
             }
         }
     }
@@ -403,11 +420,7 @@ impl NvmlCollector {
             Some(g) => g,
             None => {
                 error!("Failed to get NVML worker manager");
-                return NvmlCollectionResult {
-                    gpus: Vec::new(),
-                    unmatched_errors: Vec::new(),
-                    nvml_initialized: false,
-                };
+                return NvmlCollectionResult::failure(NvmlCollectionStatus::WorkerUnavailable);
             }
         };
         
@@ -415,11 +428,7 @@ impl NvmlCollector {
             Some(m) => m,
             None => {
                 error!("NVML worker manager is None");
-                return NvmlCollectionResult {
-                    gpus: Vec::new(),
-                    unmatched_errors: Vec::new(),
-                    nvml_initialized: false,
-                };
+                return NvmlCollectionResult::failure(NvmlCollectionStatus::WorkerUnavailable);
             }
         };
         
@@ -427,11 +436,11 @@ impl NvmlCollector {
         let timeout = self.timeout * 2;
         
         match manager.worker.collect_all(timeout) {
-            Some(result) => {
+            Ok(result) => {
                 manager.record_success();
                 result
             }
-            None => {
+            Err(status) => {
                 manager.record_timeout();
                 
                 // If now stuck, the next call will restart the worker
@@ -439,11 +448,7 @@ impl NvmlCollector {
                     warn!("NVML worker declared stuck - will restart on next collection");
                 }
                 
-                NvmlCollectionResult {
-                    gpus: Vec::new(),
-                    unmatched_errors: Vec::new(),
-                    nvml_initialized: false,
-                }
+                NvmlCollectionResult::failure(status)
             }
         }
     }
@@ -452,7 +457,7 @@ impl NvmlCollector {
 /// Collect current device evidence without allowing later success to erase faults.
 pub(super) fn collect_metrics_from_nvml(context:&NvmlContext)->NvmlCollectionResult {
     let nvml=&context.nvml;
-    let count=match nvml.device_count() {Ok(n)=>n,Err(e)=>{warn!("NVML enumeration failed: {}",e);return NvmlCollectionResult{gpus:Vec::new(),unmatched_errors:Vec::new(),nvml_initialized:true};}};
+    let count=match nvml.device_count() {Ok(n)=>n,Err(e)=>{warn!("NVML enumeration failed: {}",e);return NvmlCollectionResult{gpus:Vec::new(),unmatched_errors:Vec::new(),nvml_initialized:true,status:NvmlCollectionStatus::EnumerationError};}};
     let driver=nvml.sys_driver_version().unwrap_or_else(|_|"unknown".into());
     let mut metrics=Vec::with_capacity(count as usize);let mut unmatched_errors=Vec::new();
     for i in 0..count {
@@ -503,7 +508,7 @@ pub(super) fn collect_metrics_from_nvml(context:&NvmlContext)->NvmlCollectionRes
         }
         metrics.push(gpu);
     }
-    NvmlCollectionResult{gpus:metrics,unmatched_errors,nvml_initialized:true}
+    NvmlCollectionResult{gpus:metrics,unmatched_errors,nvml_initialized:true,status:NvmlCollectionStatus::Success}
 }
 
 /// Estimate PCIe generation and width from speed (MB/s)
@@ -651,7 +656,7 @@ pub(crate) mod tests {
     pub(crate) fn health_definition_fixture_lock() -> std::sync::MutexGuard<'static,()> {
         let guard=HEALTH_FIXTURE_LOCK.lock().unwrap_or_else(|poisoned|poisoned.into_inner());
         // Test-global provider controls never leak between independently scheduled cases.
-        for key in ["DCXP_FIXTURE_RECOVERY","DCXP_FIXTURE_QUERY","DCXP_FIXTURE_ERROR","DCXP_FIXTURE_TAG","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_LINKS","DCXP_FIXTURE_MODEL","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+        for key in ["DCXP_FIXTURE_RECOVERY","DCXP_FIXTURE_QUERY","DCXP_FIXTURE_ERROR","DCXP_FIXTURE_TAG","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_LINKS","DCXP_FIXTURE_MODEL","DCXP_FIXTURE_UNTOUCHED","DCXP_FIXTURE_INIT_ERROR","DCXP_FIXTURE_COUNT_ERROR","DCXP_FIXTURE_COUNT_DELAY","DCXP_FIXTURE_COUNT"] {std::env::remove_var(key);}
         guard
     }
     pub(crate) fn health_definition_fixture_path() -> &'static std::path::PathBuf {
@@ -691,6 +696,7 @@ pub(crate) mod tests {
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <unistd.h>
 typedef void *Device;
 typedef struct { char old[16]; unsigned domain,bus,device,id,subsystem; char busid[32]; } Pci;
 typedef struct { uint64_t total,free,used; } Memory;
@@ -708,10 +714,12 @@ static unsigned init_count,shutdown_count,field_count;
 unsigned dcxp_fixture_init_count(void) { return init_count; }
 unsigned dcxp_fixture_shutdown_count(void) { return shutdown_count; }
 unsigned dcxp_fixture_field_count(void) { return field_count; }
-unsigned nvmlInit_v2(void) { ++init_count;return 0; }
+#ifndef DCXP_FIXTURE_HIDE_INIT
+unsigned nvmlInit_v2(void) { ++init_count;return strtoul(setting("DCXP_FIXTURE_INIT_ERROR","0"),0,10); }
+#endif
 unsigned nvmlShutdown(void) { ++shutdown_count;return 0; }
 unsigned nvmlSystemGetDriverVersion(char *s,unsigned n) { snprintf(s,n,"615.71.09");return 0; }
-unsigned nvmlDeviceGetCount_v2(unsigned *n) { *n=8;return 0; }
+unsigned nvmlDeviceGetCount_v2(unsigned *n) { if(!strcmp(setting("DCXP_FIXTURE_COUNT_DELAY",""),"yes"))sleep(1);*n=strtoul(setting("DCXP_FIXTURE_COUNT","8"),0,10);return strtoul(setting("DCXP_FIXTURE_COUNT_ERROR","0"),0,10); }
 unsigned nvmlDeviceGetHandleByIndex_v2(unsigned i,Device *d) { unsigned e=failure((Device)(uintptr_t)(i+1),"device_by_index");if(e)return e;*d=(Device)(uintptr_t)(i+1);return 0; }
 unsigned nvmlDeviceGetName(Device d,char *s,unsigned n) { unsigned e=failure(d,"name");snprintf(s,n,"%s",setting("DCXP_FIXTURE_MODEL","NVIDIA L40S synthetic"));return e; }
 unsigned nvmlDeviceGetUUID(Device d,char *s,unsigned n) { unsigned e=failure(d,"uuid");snprintf(s,n,"GPU-SYNTHETIC-%u",idx(d));return e; }
@@ -900,7 +908,7 @@ unsigned nvmlDeviceGetFieldValues(Device d,int n,Field *fields) {
         for (key,value,expected) in [("DCXP_FIXTURE_QUERY","recovery_action",0),("DCXP_FIXTURE_BAD_FIELD","yes",0),
             ("DCXP_FIXTURE_TAG","99",0),("DCXP_FIXTURE_NESTED_ERROR","999",0),("DCXP_FIXTURE_NESTED_ERROR","15",2),
             ("DCXP_FIXTURE_NESTED_ERROR","16",2),("DCXP_FIXTURE_UNTOUCHED","yes",0)] {
-            for key in ["DCXP_FIXTURE_QUERY","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_TAG","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+            for key in ["DCXP_FIXTURE_QUERY","DCXP_FIXTURE_BAD_FIELD","DCXP_FIXTURE_TAG","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED","DCXP_FIXTURE_INIT_ERROR","DCXP_FIXTURE_COUNT_ERROR","DCXP_FIXTURE_COUNT_DELAY","DCXP_FIXTURE_COUNT"] {std::env::remove_var(key);}
             std::env::set_var("DCXP_FIXTURE_RECOVERY","0");std::env::set_var("DCXP_FIXTURE_ERROR","999");std::env::set_var(key,value);
             let context=health_definition_context_fixture();let gpu=collect_metrics_from_nvml(&context).gpus.remove(3);
             outcomes.push((key,value,gpu.state.as_u8(),expected));
@@ -973,7 +981,7 @@ unsigned nvmlDeviceGetFieldValues(Device d,int n,Field *fields) {
     fn health_definition_future_context_same_library_positive_and_wrong_owner_zero_calls() {
         let _guard=health_definition_fixture_lock();
         std::env::set_var("DCXP_FIXTURE_RECOVERY","1");
-        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_QUERY","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED"] {std::env::remove_var(key);}
+        for key in ["DCXP_FIXTURE_TAG","DCXP_FIXTURE_QUERY","DCXP_FIXTURE_NESTED_ERROR","DCXP_FIXTURE_UNTOUCHED","DCXP_FIXTURE_INIT_ERROR","DCXP_FIXTURE_COUNT_ERROR","DCXP_FIXTURE_COUNT_DELAY","DCXP_FIXTURE_COUNT"] {std::env::remove_var(key);}
         let first=HealthFixtureLibrary::open(crate::metrics::gpu::tests::health_definition_fixture_path().to_str().unwrap());
         let second=HealthFixtureLibrary::open(crate::metrics::gpu::tests::health_definition_other_fixture_path(false).to_str().unwrap());
         let context_a=NvmlContext::for_test(crate::metrics::gpu::tests::health_definition_fixture_path().as_os_str()).unwrap();
@@ -1025,5 +1033,221 @@ unsigned nvmlDeviceGetFieldValues(Device d,int n,Field *fields) {
         std::env::set_var("DCXP_FIXTURE_ERROR","6");
         assert_eq!(collect_metrics_from_nvml(&context).gpus[3].state.as_u8(),0,"is_active has no documented blanket NotFound exemption");
     }
+
+    // VER-NVML-001/002/003: each process starts with an owned search path before
+    // the dynamic loader runs. A precondition failure is an environment error.
+    #[cfg(target_os = "linux")]
+    struct NvmlLoaderTestLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[cfg(target_os = "linux")]
+    impl std::io::Write for NvmlLoaderTestLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nvml_loader_run_child(scenario: &str) {
+        let fixture = health_definition_fixture_path();
+        let root = fixture.parent().unwrap().join(scenario);
+        std::fs::create_dir_all(&root).unwrap();
+        let compile = |name: &str, hide_init: bool| {
+            let mut command = std::process::Command::new("cc");
+            command.args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC"]);
+            if hide_init { command.arg("-DDCXP_FIXTURE_HIDE_INIT"); }
+            let output = command.arg(fixture.parent().unwrap().join("fixture.c"))
+                .arg("-o").arg(root.join(name)).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        if !matches!(scenario, "missing" | "legacy" | "recovery") {
+            if scenario == "bad_elf" {
+                std::fs::write(root.join("libnvidia-ml.so.1"), b"owned invalid ELF fixture").unwrap();
+            } else { compile("libnvidia-ml.so.1", scenario == "missing_symbol"); }
+        }
+        if matches!(scenario, "legacy" | "both" | "bad_elf" | "init_error" | "missing_symbol" | "recovery") {
+            compile("libnvidia-ml.so", false);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "metrics::gpu::tests::nvml_loader_child", "--ignored", "--nocapture"])
+            .env("LD_LIBRARY_PATH", &root).env_remove("LD_PRELOAD").env_remove("LD_AUDIT")
+            .env("DCXP_LOADER_SCENARIO", scenario).env("DCXP_LOADER_ROOT", &root)
+            .output().unwrap();
+        assert!(output.status.success(), "scenario {scenario}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nvml_loader_assert_status(result: NvmlCollectionResult, expected: &str) {
+        let output = crate::metrics::prometheus::PrometheusFormatter::format(&crate::metrics::AllMetrics {
+            hostname: "loader-fixture".into(), nvml_gpus: result.gpus.len() as u32,
+            gpus: result.gpus, nvml_unmatched_errors: result.unmatched_errors, nvml_collection_status: result.status, ..Default::default()
+        });
+        nvml_loader_assert_one_hot(&output, expected);
+    }
+
+    pub(crate) fn nvml_loader_assert_one_hot(output: &str, expected: &str) {
+        let statuses = ["success", "library_load_error", "initialization_error", "enumeration_error", "timeout", "worker_unavailable"];
+        let rows: Vec<_> = output.lines().filter(|line| line.starts_with("DCXP_NVML_COLLECTION_STATUS{")).collect();
+        assert_eq!(rows.len(), statuses.len(), "all finite host statuses must be emitted: {output}");
+        for status in statuses {
+            let matching: Vec<_> = rows.iter().filter(|line| line.contains(&format!("status=\"{status}\""))).collect();
+            assert_eq!(matching.len(), 1, "missing or duplicate finite status {status}");
+            assert!(matching[0].contains("Hostname=\""));
+            assert!(matching[0].ends_with(if status == expected { " 1" } else { " 0" }), "stale/incorrect {status}");
+            assert!(!matching[0].contains("SYNTHETIC") && !matching[0].contains("/"), "no raw identities or paths in host status");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "only invoked by fresh-process scenario parents"]
+    fn nvml_loader_child() {
+        let _guard = health_definition_fixture_lock();
+        let scenario = std::env::var("DCXP_LOADER_SCENARIO").unwrap();
+        let root = std::path::PathBuf::from(std::env::var_os("DCXP_LOADER_ROOT").unwrap());
+        // LD_LIBRARY_PATH alone does not isolate an installed driver. Refuse it.
+        let cache = std::process::Command::new("ldconfig").arg("-p").output().expect("ldconfig precondition");
+        assert!(cache.status.success(), "cannot attest standard loader cache");
+        assert!(!String::from_utf8_lossy(&cache.stdout).contains("libnvidia-ml"), "GPU-free image must contain no cached NVIDIA provider");
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(!mounts.lines().any(|line| line.contains("libnvidia-ml")), "host NVIDIA library mount forbidden");
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(!maps.contains("libnvidia-ml"), "fresh process unexpectedly loaded NVML");
+        for directory in ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib"] {
+            if !std::path::Path::new(directory).exists() { continue; }
+            let directory = std::fs::canonicalize(directory).unwrap();
+            let output = std::process::Command::new("find").arg(&directory).args(["-name", "libnvidia-ml.so*"]).output().unwrap();
+            assert!(output.stdout.is_empty(), "GPU-free filesystem precondition failed: {}", String::from_utf8_lossy(&output.stdout));
+            assert!(output.status.success(), "cannot attest present filesystem tree: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        if scenario == "recovery" {
+            let keeper = HealthFixtureLibrary::open(root.join("libnvidia-ml.so").to_str().unwrap());
+            std::env::set_var("DCXP_FIXTURE_INIT_ERROR", "9");
+            let mut worker = NvmlWorker::new();
+            assert!(worker.ping(Duration::from_secs(3)));
+            let failed = worker.collect_all(Duration::from_secs(3)).unwrap();
+            assert!(!failed.nvml_initialized);
+            let shutdown_baseline = keeper.count("dcxp_fixture_shutdown_count");
+            std::env::set_var("DCXP_FIXTURE_INIT_ERROR", "0");
+            let recovered = worker.collect_all(Duration::from_secs(3)).unwrap();
+            assert_eq!(recovered.gpus.len(), 8);
+            let init_after_recovery = keeper.count("dcxp_fixture_init_count");
+            assert_eq!(keeper.count("dcxp_fixture_shutdown_count"), shutdown_baseline, "recovered context must stay owned by the worker");
+            std::env::set_var("DCXP_FIXTURE_INIT_ERROR", "4");
+            for _ in 0..3 {
+                let result = worker.collect_all(Duration::from_secs(3)).unwrap();
+                assert!(result.nvml_initialized && result.gpus.len() == 8, "recovery must survive later initialization unavailability");
+            }
+            assert_eq!(keeper.count("dcxp_fixture_init_count"), init_after_recovery, "no reinitialization of recovered context");
+            worker.shutdown(); worker.handle.take().unwrap().join().unwrap();
+            assert_eq!(keeper.count("dcxp_fixture_shutdown_count"), shutdown_baseline + 1);
+            return;
+        }
+        if scenario == "init_error" { std::env::set_var("DCXP_FIXTURE_INIT_ERROR", "4"); }
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = logs.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+            .with_max_level(tracing::Level::WARN).with_writer(move || NvmlLoaderTestLog(captured.clone())).finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let legacy_keeper = matches!(scenario.as_str(), "init_error" | "missing_symbol")
+            .then(|| HealthFixtureLibrary::open(root.join("libnvidia-ml.so").to_str().unwrap()));
+        let context = NvmlContext::new();
+        if matches!(scenario.as_str(), "missing" | "init_error" | "missing_symbol") {
+            let error = match context { Ok(_) => panic!("must not mask preferred-provider failure"), Err(error) => error };
+            match scenario.as_str() {
+                "missing" => assert!(matches!(error.error, NvmlError::LibloadingError(_)), "{error:?}"),
+                "init_error" => assert!(matches!(error.error, NvmlError::NoPermission), "{error:?}"),
+                _ => assert!(matches!(error.error, NvmlError::FailedToLoadSymbol(_)), "{error:?}"),
+            }
+            if scenario == "missing" {
+                let message = error.to_string();
+                assert!(message.contains("libnvidia-ml.so.1:") && message.contains("libnvidia-ml.so:"), "both candidate diagnostics: {message}");
+            } else {
+                assert_eq!(legacy_keeper.as_ref().unwrap().count("dcxp_fixture_init_count"), 0, "initialization/symbol failure must never try the legacy provider");
+            }
+            let mut worker = NvmlWorker::new();
+            let result = worker.collect_all(Duration::from_secs(3)).unwrap();
+            assert!(!result.nvml_initialized);
+            nvml_loader_assert_status(result, if scenario == "missing" { "library_load_error" } else { "initialization_error" });
+            worker.shutdown(); worker.handle.take().unwrap().join().unwrap();
+            return;
+        }
+        let context = context.expect("owned runtime/legacy provider must open without a host symlink");
+        let selected = if matches!(scenario.as_str(), "legacy" | "bad_elf") { "libnvidia-ml.so" } else { "libnvidia-ml.so.1" };
+        let keeper = HealthFixtureLibrary::open(root.join(selected).to_str().unwrap());
+        assert_eq!(keeper.count("dcxp_fixture_init_count"), 1, "deterministic runtime SONAME precedence");
+        if scenario == "bad_elf" {
+            let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("libnvidia-ml.so.1") && log.contains("libnvidia-ml.so") && log.contains("legacy"), "fallback must retain a warning: {log}");
+        }
+        crate::metrics::thermal_worker::nvml_loader_probe();
+        assert_eq!(keeper.count("dcxp_fixture_init_count"), 2, "optional thermal collection must use the same shared resolver");
+        assert_eq!(keeper.count("dcxp_fixture_shutdown_count"), 1, "thermal session closes without shutting down the core context");
+        let before = keeper.count("dcxp_fixture_field_count");
+        let result = collect_metrics_from_nvml(&context);
+        assert_eq!(result.gpus.len(), 8);
+        for (index, gpu) in result.gpus.iter().enumerate() {
+            assert_eq!(gpu.uuid, format!("GPU-SYNTHETIC-{index}"));
+            assert_eq!(gpu.recovery.as_ref().unwrap().action, Some(0));
+        }
+        assert_eq!(keeper.count("dcxp_fixture_field_count") - before, 8, "raw recovery must use the initialized provider");
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for line in maps.lines().filter(|line| line.contains("libnvidia-ml")) {
+            assert!(line.ends_with(root.join(selected).to_str().unwrap()), "foreign provider mapping: {line}");
+        }
+        if scenario == "enumeration" {
+            std::env::set_var("DCXP_FIXTURE_COUNT_ERROR", "9");
+            let result = collect_metrics_from_nvml(&context);
+            assert!(result.gpus.is_empty() && result.nvml_initialized);
+            nvml_loader_assert_status(result, "enumeration_error");
+        } else if scenario == "zero" {
+            std::env::set_var("DCXP_FIXTURE_COUNT", "0");
+            let result = collect_metrics_from_nvml(&context);
+            assert!(result.gpus.is_empty() && result.nvml_initialized);
+            nvml_loader_assert_status(result, "success");
+        } else if scenario == "partial" {
+            std::env::set_var("DCXP_FIXTURE_QUERY", "temperature"); std::env::set_var("DCXP_FIXTURE_ERROR", "999");
+            let result = collect_metrics_from_nvml(&context);
+            assert_eq!(result.gpus.len(), 8); assert!(result.gpus[3].nvml_essential_query_failed);
+            assert_eq!(crate::metrics::collector::count_usable_gpus(&result.gpus), 7);
+            nvml_loader_assert_status(result, "success");
+        } else if scenario == "timeout" {
+            std::env::set_var("DCXP_FIXTURE_COUNT_DELAY", "yes");
+            let result = NvmlCollector::new(Duration::from_millis(2)).collect_all();
+            assert!(!result.nvml_initialized && result.gpus.is_empty());
+            nvml_loader_assert_status(result, "timeout");
+        } else if scenario == "unavailable" {
+            let mut manager = NvmlWorkerManager::new(0);
+            assert!(manager.worker.ping(Duration::from_secs(3)));
+            manager.worker.shutdown(); manager.worker.handle.take().unwrap().join().unwrap();
+            *NVML_MANAGER.write().unwrap() = Some(manager);
+            nvml_loader_assert_status(NvmlCollector { timeout: Duration::from_secs(1) }.collect_all(), "worker_unavailable");
+        } else { nvml_loader_assert_status(result, "success"); }
+    }
+
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_runtime_soname_only() { nvml_loader_run_child("runtime"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_legacy_only() { nvml_loader_run_child("legacy"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_runtime_precedes_legacy() { nvml_loader_run_child("both"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_missing_preserves_both_diagnostics() { nvml_loader_run_child("missing"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_bad_elf_falls_back() { nvml_loader_run_child("bad_elf"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_native_init_failure_does_not_fallback() { nvml_loader_run_child("init_error"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_missing_symbol_does_not_fallback() { nvml_loader_run_child("missing_symbol"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_recovered_worker_retains_context() { nvml_loader_run_child("recovery"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_enumeration_status() { nvml_loader_run_child("enumeration"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_successful_empty_enumeration() { nvml_loader_run_child("zero"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_partial_query_failure_preserves_success() { nvml_loader_run_child("partial"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_timeout_status() { nvml_loader_run_child("timeout"); }
+    #[test] #[cfg(target_os = "linux")]
+    fn nvml_loader_disconnected_worker_status() { nvml_loader_run_child("unavailable"); }
 
 }
