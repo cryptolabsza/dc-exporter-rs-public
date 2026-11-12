@@ -169,7 +169,7 @@ class PublicPoolExportTests(unittest.TestCase):
         frozen = {'src/tui/app.rs': 'a105c80a8294205b73b0e562044c05337d81a4a679f4d2a63c30742fd8ae728e', 'src/tui/mod.rs': 'd29db51ead2a40eb7450acd3828a5cc5064fab0f8f137c4065826e07e9181175', 'src/tui/ui.rs': 'f1945cb91ac159c2739cb125ed116eddb013e81e20a36db9c43d20a93184a493'}
         for path, digest in frozen.items():
             self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(), digest, path)
-        self.assertIn(PACKAGE["version"], {"0.2.7", "0.3.0"})
+        self.assertIn(PACKAGE["version"], {"0.2.7", "0.3.0", "0.3.1", "0.3.2"})
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
         roots = [p for p in lock["package"] if p["name"] == PACKAGE["name"] and "source" not in p]
         self.assertEqual(len(roots), 1)
