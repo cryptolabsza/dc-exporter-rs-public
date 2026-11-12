@@ -101,6 +101,9 @@ optional memory backend requires `/dev/mem` or a kernel-parameter change.
 
 ## Memory and hotspot temperatures
 
+The TUI list shows each GPU's driver version on its card's lower border, so a
+temperature screenshot also identifies the driver. Missing versions show `N/A`.
+
 The default memory policy is **`auto`**. Each eligible host GPU prefers the official
 NVML memory-temperature field, then an exact supported RUSD profile, then an
 existing permitted measured legacy BAR reading. Each fallback requires an explicit

@@ -217,9 +217,12 @@ fn draw_gpu_card(
         gpu.index, gpu.name, gpu.pci_bus_id, state_str, source_str
     );
 
+    let driver = gpu.driver_version.trim();
+    let driver = if driver.is_empty() { "N/A" } else { driver };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
+        .title_bottom(format!(" Driver: {driver} "))
         .title(Span::styled(
             title,
             Style::default()
@@ -1253,5 +1256,59 @@ fn state_color(state: GpuState) -> Color {
         GpuState::VmPassthrough => Color::Magenta,
         GpuState::Unavailable => Color::DarkGray,
         GpuState::HardwareFailure => Color::LightRed,
+    }
+}
+
+#[cfg(test)]
+mod driver_display_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn card_text(width: u16, driver: &str, state: GpuState) -> String {
+        let gpu = GpuMetrics {
+            name: "NVIDIA GeForce RTX 5090".into(),
+            pci_bus_id: "0000:04:00.0".into(),
+            driver_version: driver.into(),
+            state,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, 7)).unwrap();
+        terminal.draw(|frame| {
+            draw_gpu_card(frame, &gpu, None, frame.area(), true);
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height).map(|y| {
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    // REQ-CLIENT-001 / VER-CLIENT-001: exercise the rendered default list card.
+    #[test]
+    fn list_card_displays_driver_without_hiding_gpu_identity_or_fault_state() {
+        for width in [80, 120] {
+            let text = card_text(width, "615.78.08", GpuState::HardwareFailure);
+            for expected in ["Driver: 615.78.08", "RTX 5090", "0000:04:00.0", "HW FAILURE"] {
+                assert!(text.contains(expected), "missing {expected} at width {width}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_card_reports_missing_driver_as_unavailable() {
+        for driver in ["", "   "] {
+            let text = card_text(80, driver, GpuState::Unavailable);
+            assert!(text.contains("Driver: N/A"), "{text}");
+            assert!(text.contains("UNAVAIL"), "{text}");
+        }
+    }
+
+    #[test]
+    fn list_card_uses_each_gpus_reported_driver() {
+        let first = card_text(80, "595.104.02", GpuState::Ok);
+        let second = card_text(80, "615.71.09", GpuState::Ok);
+        assert!(first.contains("Driver: 595.104.02"));
+        assert!(!first.contains("615.71.09"));
+        assert!(second.contains("Driver: 615.71.09"));
+        assert!(!second.contains("595.104.02"));
     }
 }
