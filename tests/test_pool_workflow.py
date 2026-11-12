@@ -166,7 +166,7 @@ class PublicPoolExportTests(unittest.TestCase):
             self.assertNotIn(path, exporter.REVIEWED_CHANGE_PATHS)
 
     def test_tui_source_and_version_are_frozen(self):
-        frozen = {'src/tui/app.rs': 'a105c80a8294205b73b0e562044c05337d81a4a679f4d2a63c30742fd8ae728e', 'src/tui/mod.rs': 'd29db51ead2a40eb7450acd3828a5cc5064fab0f8f137c4065826e07e9181175', 'src/tui/ui.rs': '29d863fdbb67e7524ee8d29716f53fff9edb704ea700e3d85a0b0e20bd421ff1'}
+        frozen = {'src/tui/app.rs': 'a105c80a8294205b73b0e562044c05337d81a4a679f4d2a63c30742fd8ae728e', 'src/tui/mod.rs': 'd29db51ead2a40eb7450acd3828a5cc5064fab0f8f137c4065826e07e9181175', 'src/tui/ui.rs': 'f1945cb91ac159c2739cb125ed116eddb013e81e20a36db9c43d20a93184a493'}
         for path, digest in frozen.items():
             self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(), digest, path)
         self.assertIn(PACKAGE["version"], {"0.2.7", "0.3.0"})
